@@ -13,12 +13,12 @@ wiiland-show \- inspect and exercise a connected Wii Remote
 .I /sys/path/to/device
 .SH DESCRIPTION
 .B wiiland-show list
-enumerates connected Wii Remotes and writes one tab-separated positive ordinal
+queries the running daemon for connected Wii Remotes and writes one tab-separated positive ordinal
 and sysfs path per line.  It is intended for pipelines and does not require a
 terminal.  An empty list is successful and produces no lines.
 .PP
-The ordinal and absolute-path forms open one remote in an interactive
-ratatui/crossterm terminal interface.  The ordinal is resolved in monitor
+The ordinal and absolute-path forms observe one remote through daemon IPC in an interactive
+ratatui/crossterm terminal interface.  The ordinal is resolved in daemon device
 order, as printed by
 .BR list .
 The path form must begin with
@@ -46,9 +46,21 @@ when both dimensions are at least 160 by 48.  A smaller terminal is rejected.
 Print help and exit successfully.  Help lists the interactive keyboard
 commands.
 .PP
-There are no other options.  Device selection is positional.
+.TP
+.B --direct
+Own hardware directly. Stop wiilandd before using this mode. Device listing
+uses the hardware monitor, and all hardware commands below are available.
+.TP
+.B --socket PATH
+Connect to an explicit daemon socket instead of the private per-user default.
+This option conflicts with --direct. Device selection remains positional.
+.PP
+Daemon capture requires protocol 1.1 or newer and keeps normal virtual input
+active. A daemon disconnect or capture queue overflow ends the session and
+restores the terminal. Start a new session to reconnect.
 .SH INTERACTIVE COMMANDS
-Commands are recognized on key press or repeat:
+In daemon mode, q and f are available. The remaining hardware commands require
+--direct. Commands are recognized on key press or repeat:
 .TP
 .B q
 Quit and restore the terminal.

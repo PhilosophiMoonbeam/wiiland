@@ -537,3 +537,29 @@ fn file_loader_enforces_line_size_and_utf8() {
     Config::load_file(&accepted).unwrap();
     remove(&accepted);
 }
+
+#[test]
+fn byte_parser_and_file_loader_share_line_boundaries_and_errors() {
+    for bytes in [
+        b"profile=desktop\r\n".to_vec(),
+        b"profile=desktop".to_vec(),
+        vec![b'#'; 512],
+        vec![0xff],
+        b"pointer-speed=0\n".to_vec(),
+    ] {
+        let path =
+            std::env::temp_dir().join(format!("wiiland-parser-parity-{}", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let parsed = wiiland_core::Config::parse_bytes(&path, &bytes);
+        let loaded = wiiland_core::Config::load_file(&path);
+        match (parsed, loaded) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b),
+            (Err(a), Err(b)) => {
+                assert_eq!(a.line, b.line);
+                assert_eq!(a.message, b.message);
+            }
+            pair => panic!("parser disagreement: {pair:?}"),
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}

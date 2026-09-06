@@ -14,11 +14,13 @@
 
 mod client;
 mod protocol;
+mod session;
 
 pub use client::{Client, ClientError, default_socket_path};
 pub use protocol::{
-    Axis3, ButtonEvent, Command, DeviceInfo, FrameBuffer, FrameError, InputPayload,
-    MAX_FRAME_BYTES, Notification, PROTOCOL_MAJOR, PROTOCOL_MINOR, Profile, ProtocolError,
-    ProtocolErrorCode, RemovalReason, Request, ResponseResult, ServerMessage, Status, Subscription,
-    Subscriptions, Timestamp, decode_frame, encode_frame,
+    Axis3, ButtonEvent, Command, DeviceInfo, Diagnostics, FrameBuffer, FrameError, InputPayload,
+    MAX_CAPTURE_DEVICES, MAX_FRAME_BYTES, Notification, PROTOCOL_MAJOR, PROTOCOL_MINOR, Profile,
+    ProtocolError, ProtocolErrorCode, RemovalReason, Request, ResponseResult, ServerMessage,
+    Status, Subscription, Subscriptions, Timestamp, decode_frame, encode_frame,
 };
+pub use session::{Session, SessionEvent, select_devices};

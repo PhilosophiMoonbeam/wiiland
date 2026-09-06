@@ -144,6 +144,14 @@ fn hello_status_devices_and_ping() {
     });
 
     let mut client = Client::connect(&path).unwrap();
+    assert_eq!(client.protocol_version(), (1, 0));
+    assert!(matches!(
+        client.start_capture("/sys/test"),
+        Err(ClientError::UnsupportedFeature {
+            peer_minor: 0,
+            required_minor: 1
+        })
+    ));
     assert_eq!(client.status().unwrap().pid, 42);
     assert_eq!(client.devices().unwrap().len(), 1);
     client.ping().unwrap();
@@ -606,4 +614,110 @@ fn default_socket_requires_absolute_runtime_directory() {
         Some(value) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", value) },
         None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
     }
+}
+
+#[test]
+fn background_capture_preserves_partial_frames_and_cancellation_closes_lease() {
+    use std::time::{Duration, Instant};
+    use wiiland_ipc::{ButtonEvent, InputPayload, Session, SessionEvent, Timestamp};
+    let (path, listener) = start_server("session");
+    let (sent, received) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let request = read_request(&mut reader);
+        send(&mut stream, hello(request.id, 1, 1));
+        let request = read_request(&mut reader);
+        assert!(matches!(request.command, Command::Status));
+        send(&mut stream, status(request.id));
+        let request = read_request(&mut reader);
+        assert!(matches!(request.command, Command::Devices));
+        send(
+            &mut stream,
+            ServerMessage::Response {
+                id: request.id,
+                result: ResponseResult::Devices(vec![device()]),
+            },
+        );
+        let request = read_request(&mut reader);
+        assert!(matches!(request.command, Command::Subscribe { .. }));
+        send(
+            &mut stream,
+            ServerMessage::Response {
+                id: request.id,
+                result: ResponseResult::Subscribed,
+            },
+        );
+        let request = read_request(&mut reader);
+        assert!(
+            matches!(request.command, Command::StartCapture { syspath } if syspath == "/sys/test")
+        );
+        send(
+            &mut stream,
+            ServerMessage::Response {
+                id: request.id,
+                result: ResponseResult::CaptureStarted(device()),
+            },
+        );
+        let event = ServerMessage::Notification(Notification::Input {
+            sequence: 1,
+            syspath: "/sys/test".into(),
+            timestamp: Timestamp {
+                seconds: 0,
+                micros: 0,
+            },
+            payload: InputPayload::Key(ButtonEvent { code: 4, state: 1 }),
+        });
+        let bytes = encode_frame(&event).unwrap();
+        stream.write_all(&bytes[..5]).unwrap();
+        thread::sleep(Duration::from_millis(160));
+        stream.write_all(&bytes[5..]).unwrap();
+        sent.send(()).unwrap();
+        let mut line = Vec::new();
+        assert_eq!(
+            reader.read_until(b'\n', &mut line).unwrap(),
+            0,
+            "cancellation must close the capture connection"
+        );
+    });
+    let session = Session::start(Some(path.clone()), "1".into(), true);
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut connected = false;
+    let mut input = false;
+    while !input {
+        match session.try_recv() {
+            Ok(SessionEvent::Connected { devices, .. }) => {
+                connected = true;
+                assert_eq!(devices[0].syspath, "/sys/test");
+            }
+            Ok(SessionEvent::Notification(Notification::Input {
+                payload: InputPayload::Key(button),
+                ..
+            })) => {
+                assert!(connected);
+                assert_eq!(button.code, 4);
+                input = true;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    session.cancel();
+    loop {
+        if let Ok(result) = session.try_finish() {
+            result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    server.join().unwrap();
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }

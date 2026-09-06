@@ -8,8 +8,8 @@ wiiland-config \- graphical WiiLand configuration and diagnostics
 opens the WiiLand Control Center, a native eframe/egui application.  It edits
 Wii Remote profiles and device rules, invokes
 .BR wiilandd (1)
-for configuration and diagnostics, captures event traces and motion
-calibration, and controls the per-user systemd service.
+for offline configuration and diagnostics, captures live traces and motion
+calibration through daemon IPC, and controls the per-user systemd service.
 .PP
 The initial window is 1180 by 780 pixels and cannot be resized below 760 by
 600.  The application id is
@@ -127,28 +127,29 @@ explicit target because the installed service does not load that target.
 Ctrl+S validates and saves pending edits without restarting the service.
 .SH TEST AND CALIBRATE
 Test & calibrate accepts an optional device selector (a positive ordinal or
-sysfs path), an event filter (all, keys, axes, ir, or motion-plus), and an
-optional temporary profile (effective configuration, gamepad, desktop, or
-both).
+sysfs path) and event filter (all, keys, axes, ir, or motion-plus).
+By default it captures through the running daemon using IPC 1.1, while normal
+virtual input remains active. Refresh daemon status shows the running
+configuration and reactor timing/loss counters in the activity log.
 .TP
 .B Start trace
-Run wiilandd with
-.BR --dry-run ,
-.BR --trace-events ,
-and
-.B --verbose .  A selected device is passed through
-.BR --device .
-No virtual input is created.
+Lease readable sensors for the selected daemon device, or all devices present
+at capture startup when no selector is given. Start a new session for newly
+connected controllers.
 .TP
 .B Stop capture
-Request termination of the active trace or calibration process.
+Cancel capture and close its connection, releasing its sensor leases.
 .TP
 .B Capture calibration
-Run
-.BR --calibrate-aim
-with the configured sample duration and optional device selector.  Successful
-output is applied to the form and marked unsaved; save it to persist the
-values.
+Collect samples for the configured duration. An empty selector chooses the
+first daemon device. Stable accelerometer and MotionPlus values are computed
+independently, applied to the form, and marked unsaved. Device loss, interface
+changes, and queue overflow reject the capture.
+.TP
+.B Direct hardware diagnostics
+Use this explicit mode with the daemon stopped for standalone subprocess
+capture. Traces run with --dry-run and --no-ipc; temporary profiles apply only
+in this mode. Calibration uses --calibrate-aim.
 .PP
 Trace and calibration are mutually exclusive.  Capture selectors are locked
 while a capture is running.  Stop capture also remains available in the

@@ -1,4 +1,5 @@
 mod app;
+mod daemon;
 mod render;
 
 use std::env;
@@ -22,7 +23,7 @@ const UI_HELP: &str = "UI commands:\n  q: Quit application\n  f: Freeze/Unfreeze
 fn write_help(mut output: impl Write, program: &str) {
     let _ = write!(
         output,
-        "Usage:\n  {program} -h|--help\n  {program} list\n  {program} <positive-ordinal>\n  {program} /sys/path/to/device\n{UI_HELP}"
+        "Usage:\n  {program} -h|--help\n  {program} list\n  {program} <positive-ordinal>\n  {program} /sys/path/to/device\nOptions:\n  --direct  Own hardware directly (stop wiilandd first)\n  --socket PATH  Use an explicit daemon socket\nDefault: observe the running daemon; q/f are available.\nDirect hardware UI commands:\n{UI_HELP}"
     );
 }
 
@@ -34,7 +35,30 @@ pub fn run<I>(args: I) -> i32
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    let args: Vec<_> = args.into_iter().collect();
+    let mut raw = args.into_iter();
+    let mut args = Vec::new();
+    if let Some(program) = raw.next() {
+        args.push(program);
+    }
+    let mut direct = false;
+    let mut socket = None;
+    while let Some(arg) = raw.next() {
+        if arg == "--direct" {
+            direct = true;
+        } else if arg == "--socket" {
+            let Some(path) = raw.next() else {
+                eprintln!("wiiland-show: --socket requires a path");
+                return 1;
+            };
+            socket = Some(PathBuf::from(path));
+        } else {
+            args.push(arg);
+        }
+    }
+    if direct && socket.is_some() {
+        eprintln!("wiiland-show: --direct and --socket conflict");
+        return 1;
+    }
     let program = args
         .first()
         .map(|s| s.to_string_lossy())
@@ -50,7 +74,11 @@ where
     }
     let selector_arg = args[1].to_string_lossy().into_owned();
     if selector_arg == "list" {
-        return list_devices(&program);
+        return if direct {
+            list_devices(&program)
+        } else {
+            daemon::list(&program, socket)
+        };
     }
     let selector = match parse_selector(&selector_arg) {
         Ok(value) => value,
@@ -63,6 +91,9 @@ where
             return 1;
         }
     };
+    if !direct {
+        return daemon::run(&program, &selector_arg, socket);
+    }
     let path = match selector {
         Selector::Path(path) => path.to_path_buf(),
         Selector::Ordinal(n) => match ordinal_path(n, &program) {

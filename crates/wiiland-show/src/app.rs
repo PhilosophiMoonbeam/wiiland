@@ -456,27 +456,7 @@ fn read_attr(iface: &Interface, name: &str) -> String {
 }
 
 fn event_type(kind: EventKind) -> EventType {
-    match kind {
-        EventKind::Key(_) => EventType::Key,
-        EventKind::Accel(_) => EventType::Accel,
-        EventKind::Ir(_) => EventType::Ir,
-        EventKind::BalanceBoard(_) => EventType::BalanceBoard,
-        EventKind::MotionPlus(_) => EventType::MotionPlus,
-        EventKind::ProControllerKey(_) => EventType::ProControllerKey,
-        EventKind::ProControllerMove(_) => EventType::ProControllerMove,
-        EventKind::Watch => EventType::Watch,
-        EventKind::ClassicControllerKey(_) => EventType::ClassicControllerKey,
-        EventKind::ClassicControllerMove(_) => EventType::ClassicControllerMove,
-        EventKind::NunchukKey(_) => EventType::NunchukKey,
-        EventKind::NunchukMove(_) => EventType::NunchukMove,
-        EventKind::DrumsKey(_) => EventType::DrumsKey,
-        EventKind::DrumsMove(_) => EventType::DrumsMove,
-        EventKind::GuitarKey(_) => EventType::GuitarKey,
-        EventKind::GuitarMove(_) => EventType::GuitarMove,
-        EventKind::Gone => EventType::Gone,
-        EventKind::Unknown(value) => EventType::Unknown(value),
-        _ => EventType::Unknown(u32::MAX),
-    }
+    kind.event_type()
 }
 
 fn set_key(keys: &mut [bool; 28], key: ButtonEvent) {
@@ -492,69 +472,10 @@ fn set_key(keys: &mut [bool; 28], key: ButtonEvent) {
 }
 
 fn button_index(button: Button) -> Option<usize> {
-    match button {
-        Button::Left => Some(0),
-        Button::Right => Some(1),
-        Button::Up => Some(2),
-        Button::Down => Some(3),
-        Button::A => Some(4),
-        Button::B => Some(5),
-        Button::Plus => Some(6),
-        Button::Minus => Some(7),
-        Button::Home => Some(8),
-        Button::One => Some(9),
-        Button::Two => Some(10),
-        Button::X => Some(11),
-        Button::Y => Some(12),
-        Button::ShoulderLeft => Some(13),
-        Button::ShoulderRight => Some(14),
-        Button::TriggerLeft => Some(15),
-        Button::TriggerRight => Some(16),
-        Button::ThumbLeft => Some(17),
-        Button::ThumbRight => Some(18),
-        Button::C => Some(19),
-        Button::Z => Some(20),
-        Button::StrumBarUp => Some(21),
-        Button::StrumBarDown => Some(22),
-        Button::FretFarUp => Some(23),
-        Button::FretUp => Some(24),
-        Button::FretMid => Some(25),
-        Button::FretLow => Some(26),
-        Button::FretFarLow => Some(27),
-        _ => None,
-    }
+    Some(button.code() as usize)
 }
 
-pub(crate) const BUTTON_ORDER: [Button; 28] = [
-    Button::Left,
-    Button::Right,
-    Button::Up,
-    Button::Down,
-    Button::A,
-    Button::B,
-    Button::Plus,
-    Button::Minus,
-    Button::Home,
-    Button::One,
-    Button::Two,
-    Button::X,
-    Button::Y,
-    Button::ShoulderLeft,
-    Button::ShoulderRight,
-    Button::TriggerLeft,
-    Button::TriggerRight,
-    Button::ThumbLeft,
-    Button::ThumbRight,
-    Button::C,
-    Button::Z,
-    Button::StrumBarUp,
-    Button::StrumBarDown,
-    Button::FretFarUp,
-    Button::FretUp,
-    Button::FretMid,
-    Button::FretLow,
-    Button::FretFarLow,
-];
+pub(crate) const BUTTON_ORDER: [Button; 28] = Button::ALL;
 
 pub(crate) fn button_at(index: usize) -> Option<Button> {
     BUTTON_ORDER.get(index).copied()

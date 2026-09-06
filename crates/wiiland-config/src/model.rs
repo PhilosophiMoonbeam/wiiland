@@ -322,15 +322,7 @@ impl ConfigModel {
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        let path = PathBuf::from(xdg);
-        if path.is_absolute() {
-            return Some(path.join("wiiland/wiilandd.conf"));
-        }
-    }
-    std::env::var_os("HOME")
-        .filter(|home| Path::new(home).is_absolute())
-        .map(|home| PathBuf::from(home).join(".config/wiiland/wiilandd.conf"))
+    wiiland_core::config_io::user_config_path()
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -342,18 +334,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 pub fn parse_config_bytes(bytes: &[u8]) -> Result<Config, ConfigError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| ConfigError {
-        path: PathBuf::from("daemon-output"),
-        line: None,
-        message: "invalid UTF-8".to_owned(),
-        source: None,
-    })?;
-    let mut config = Config::default();
-    for (line_no, line) in text.lines().enumerate() {
-        config.apply_line("daemon-output", line_no + 1, line)?;
-    }
-    config.validate()?;
-    Ok(config)
+    Config::parse_bytes("daemon-output", bytes)
 }
 
 pub fn render_config(config: &Config) -> Vec<u8> {

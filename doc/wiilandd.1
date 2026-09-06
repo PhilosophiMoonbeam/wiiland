@@ -267,6 +267,17 @@ by the daemon's effective user.  An existing live socket is never taken over.
 Only a stale socket with the same observed inode is removed, and shutdown
 unlinks only the inode bound by this daemon.  There is no socket activation,
 installed socket, C ABI, or installed client interface.
+.PP
+Protocol minor 1 adds diagnostics, running configuration, and sensor capture
+leases. Captures are connection-owned and share interfaces across clients.
+Stopping a capture or disconnecting releases its leases; profile-required
+interfaces remain open. Diagnostic-only sensor reports do not feed virtual
+input. Existing protocol major 1 commands and message shapes remain supported.
+.PP
+Trace and lifecycle output use bounded background queues. A slow output reader
+can cause diagnostic records to be dropped, but cannot block input ingestion.
+The diagnostics command exposes queue-loss counts and maximum pointer lateness
+and dispatch duration. Writer shutdown waits at most 100 ms per stream.
 .SH CONFIGURATION
 Configuration files contain one
 .B key=value

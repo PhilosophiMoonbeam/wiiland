@@ -1,7 +1,7 @@
 WIILANDD DAEMON IPC PROTOCOL
 ============================
 
-Status: private protocol, version 1.0
+Status: private protocol, version 1.1
 
 This document is the language-neutral wire specification for the private IPC
 socket exposed by wiilandd.  The protocol version is independent of the Cargo
@@ -119,13 +119,13 @@ The first request on a connection MUST be Hello:
     {"id":1,"command":{"type":"hello","min_major":1,"max_major":1}}
 
 `min_major` and `max_major` are u16 values describing the inclusive major
-range the client can use.  The server currently supports major 1, minor 0.
+range the client can use.  The server currently supports major 1, minor 1.
 If the ranges include major 1, it replies with:
 
-    {"type":"response","value":{"id":1,"result":{"type":"hello","value":{"major":1,"minor":0,"daemon_version":"VERSION"}}}}
+    {"type":"response","value":{"id":1,"result":{"type":"hello","value":{"major":1,"minor":1,"daemon_version":"VERSION"}}}}
 
 `daemon_version` is the daemon's package version string, not the protocol
-version.  The selected major/minor are reported in the response; minor 0 is
+version.  The selected major/minor are reported in the response; minor 1 is
 the version currently implemented.
 
 If no supported major is in the requested range, the server sends an error
@@ -145,6 +145,10 @@ response has the same request id.  The command and result shapes are:
     {"type":"ping"}
     {"type":"status"}
     {"type":"devices"}
+    {"type":"diagnostics"}                         (since 1.1)
+    {"type":"config"}                              (since 1.1)
+    {"type":"start_capture", "syspath":STRING}       (since 1.1)
+    {"type":"stop_capture"}                        (since 1.1)
     {"type":"subscribe", "subscriptions":[SUBSCRIPTION, ...]}
     {"type":"unsubscribe", "subscriptions":[SUBSCRIPTION, ...]}
 
@@ -156,6 +160,10 @@ A successful result is one of:
     {"type":"pong"}
     {"type":"status", "value":STATUS}
     {"type":"devices", "value":[DEVICE_INFO, ...]}
+    {"type":"diagnostics", "value":DIAGNOSTICS}      (since 1.1)
+    {"type":"config", "value":STRING}                (since 1.1)
+    {"type":"capture_started", "value":DEVICE_INFO}  (since 1.1)
+    {"type":"capture_stopped"}                      (since 1.1)
     {"type":"subscribed"}
     {"type":"unsubscribed"}
 
@@ -172,6 +180,37 @@ at that response.
 An unknown command type is represented by the unknown command and returns an
 error with code unknown_command.  Unknown commands do not close an already
 negotiated connection.
+
+Config returns canonical key=value text of the running configuration, including
+CLI overrides. It does not read or save files. Diagnostics returns this object:
+
+    {"trace_records_dropped":U64,
+     "lifecycle_records_dropped":U64,
+     "max_pointer_lateness_us":U64,
+     "max_dispatch_duration_us":U64}
+
+The dropped counters count diagnostic records rejected by the bounded writer
+queues (full, oversized, or disconnected). Timing maxima are cumulative for
+this daemon runtime and measured in microseconds. Dispatch duration excludes
+poll waiting. These counters do not change the STATUS shape.
+
+StartCapture opens all readable sensor interfaces for a device already owned
+by the daemon. The result reports opened and pending interfaces. Unavailable
+interfaces may remain pending. An unknown syspath returns invalid_request;
+an interface-open failure returns internal. Acquisition is idempotent per
+connection; at most 32 devices may be leased by each connection. Requests
+exceeding that limit return invalid_request. Subscribe is still required to
+receive notifications. Capture-only interfaces never feed virtual output.
+StopCapture releases all leases belonging to that connection. A connection's
+leases also disappear on disconnect or queue eviction. Leases from other
+clients and interfaces required by the configured profile remain active.
+
+Control operations are deferred to the reactor with at most eight pending
+commands per connection. Exceeding this bound disconnects the client. Response
+IDs remain correlated; pipelined callers must not assume response order across
+immediate snapshot requests and deferred control commands. Minor-0 clients
+can continue using their existing commands unchanged. Minor-1 command methods
+in the Rust client check the negotiated minor before sending the request.
 
 6. ERRORS
 ---------
@@ -385,3 +424,12 @@ package; it does not install a client executable, C header, static/shared
 library, pkg-config file, or a stable Rust binary ABI.  This document and the
 source protocol definitions, rather than any compiled ABI, define the
 integration boundary.
+
+The optional Rust Session facade runs a blocking Client on a background worker.
+Its event queue holds at most 64 events; overflow terminates with
+SessionBacklogExceeded rather than dropping individual events. Completion is
+not exposed until queued events are delivered. Cancellation closes the socket,
+releasing capture leases. The session captures a device-list snapshot; restart
+it to select newly added devices. Hello read/write operations have a two-second
+timeout. Ordinary Client operations retain configurable blocking timeouts;
+Session uses finite request timeouts and 100ms read timeouts for cancellation.

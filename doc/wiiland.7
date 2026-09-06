@@ -124,10 +124,16 @@ saves, service controls, and stale asynchronous-completion protection.  Trace
 and calibration actions are mutually exclusive.  Fixed-width command output
 retains the most recent 10,000 text blocks.
 .PP
+Live trace and calibration normally use daemon IPC 1.1, keeping virtual input
+active. The GUI also offers explicit direct-hardware diagnostics with the
+service stopped.
+.PP
 The optional
 .B wiiland-show
 diagnostic is a ratatui/crossterm TUI.  It supports 80x24 minimum and 160x48
-extended layouts, full controller displays, and terminal cleanup on exit.
+extended layouts, full controller displays, and terminal cleanup on exit. It uses daemon IPC by default; q quits and f freezes.
+Use --direct with the daemon stopped for hardware controls, or --socket PATH
+for a custom daemon endpoint.
 .
 .SH PERMISSIONS
 wiilandd must read the hid-wiimote

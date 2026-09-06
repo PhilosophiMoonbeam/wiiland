@@ -88,7 +88,7 @@ fn invalid_selectors_never_open_a_device() {
 
 #[test]
 fn list_is_pipeline_safe() {
-    let output = run(&["list"]);
+    let output = run(&["--direct", "list"]);
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -99,4 +99,57 @@ fn list_is_pipeline_safe() {
             assert!(fields.next().is_none());
         }
     }
+}
+
+#[test]
+fn default_list_uses_the_daemon_without_opening_hardware() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use wiiland_ipc::{Request, ResponseResult, ServerMessage};
+    let root = std::env::temp_dir().join(format!("wiiland-show-ipc-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("wiiland")).unwrap();
+    let path = root.join("wiiland/wiilandd.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        for result in [
+            ResponseResult::Hello {
+                major: 1,
+                minor: 1,
+                daemon_version: "test".into(),
+            },
+            ResponseResult::Devices(Vec::new()),
+        ] {
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).unwrap();
+            let request: Request = wiiland_ipc::decode_frame(&line).unwrap();
+            stream
+                .write_all(
+                    &wiiland_ipc::encode_frame(&ServerMessage::Response {
+                        id: request.id,
+                        result,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_wiiland-show"))
+        .env("XDG_RUNTIME_DIR", &root)
+        .arg("list")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }

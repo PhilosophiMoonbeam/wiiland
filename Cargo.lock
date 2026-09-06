@@ -3438,6 +3438,7 @@ dependencies = [
  "egui",
  "tempfile",
  "wiiland-core",
+ "wiiland-ipc",
 ]
 
 [[package]]
@@ -3474,6 +3475,7 @@ dependencies = [
  "libc",
  "ratatui",
  "wiiland-hid",
+ "wiiland-ipc",
 ]
 
 [[package]]

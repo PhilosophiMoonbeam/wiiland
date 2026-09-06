@@ -1,5 +1,6 @@
 //! Single-thread monitor/device reactor.
 use crate::bridge::{BridgeAction, BridgeDevice};
+use crate::diagnostics::DiagnosticWriter;
 use crate::ipc::IpcServer;
 use crate::signal::SignalPipe;
 use crate::uinput::{Backend, SystemBackend};
@@ -57,46 +58,11 @@ fn axis(value: Abs) -> Axis3 {
 }
 
 fn button_code(button: Button) -> Option<u32> {
-    Some(match button {
-        Button::Left => 0,
-        Button::Right => 1,
-        Button::Up => 2,
-        Button::Down => 3,
-        Button::Plus => 6,
-        Button::Minus => 7,
-        Button::One => 9,
-        Button::Two => 10,
-        Button::A => 4,
-        Button::B => 5,
-        Button::Home => 8,
-        Button::C => 19,
-        Button::Z => 20,
-        Button::X => 11,
-        Button::Y => 12,
-        Button::ShoulderLeft => 13,
-        Button::ShoulderRight => 14,
-        Button::TriggerLeft => 15,
-        Button::TriggerRight => 16,
-        Button::ThumbLeft => 17,
-        Button::ThumbRight => 18,
-        Button::StrumBarUp => 21,
-        Button::StrumBarDown => 22,
-        Button::FretFarUp => 23,
-        Button::FretUp => 24,
-        Button::FretMid => 25,
-        Button::FretLow => 26,
-        Button::FretFarLow => 27,
-        _ => return None,
-    })
+    Some(button.code())
 }
 
 fn button_state(state: ButtonState) -> Option<u32> {
-    match state {
-        ButtonState::Released => Some(0),
-        ButtonState::Pressed => Some(1),
-        ButtonState::Repeated => Some(2),
-        _ => None,
-    }
+    Some(state.value())
 }
 
 fn button(value: HidButtonEvent) -> Option<ButtonEvent> {
@@ -221,10 +187,11 @@ struct Diagnostics {
 }
 
 impl Diagnostics {
-    fn stderr() -> Self {
+    fn queued(writer: &DiagnosticWriter) -> Self {
+        let sender = writer.sender();
         Self {
             enabled: false,
-            sink: Box::new(|line| eprintln!("{line}")),
+            sink: Box::new(move |line| sender.send(line)),
         }
     }
 
@@ -244,27 +211,7 @@ fn io_errno(error: &io::Error) -> i32 {
 }
 
 fn event_type_code(kind: EventKind) -> u32 {
-    match kind {
-        EventKind::Key(_) => 0,
-        EventKind::Accel(_) => 1,
-        EventKind::Ir(_) => 2,
-        EventKind::BalanceBoard(_) => 3,
-        EventKind::MotionPlus(_) => 4,
-        EventKind::ProControllerKey(_) => 5,
-        EventKind::ProControllerMove(_) => 6,
-        EventKind::Watch => 7,
-        EventKind::ClassicControllerKey(_) => 8,
-        EventKind::ClassicControllerMove(_) => 9,
-        EventKind::NunchukKey(_) => 10,
-        EventKind::NunchukMove(_) => 11,
-        EventKind::DrumsKey(_) => 12,
-        EventKind::DrumsMove(_) => 13,
-        EventKind::GuitarKey(_) => 14,
-        EventKind::GuitarMove(_) => 15,
-        EventKind::Gone => 16,
-        EventKind::Unknown(value) => value,
-        _ => u32::MAX,
-    }
+    kind.event_type().code()
 }
 
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) -> bool {
@@ -286,8 +233,8 @@ fn missing_slots<'a>(
 }
 
 pub struct Runtime<B: Backend + Clone = SystemBackend> {
-    pub config: Config,
-    pub slots: [Option<BridgeDevice<B>>; MAX_DEVICES],
+    config: Config,
+    slots: [Option<BridgeDevice<B>>; MAX_DEVICES],
     monitor: Option<Monitor>,
     signal: SignalPipe,
     backend: B,
@@ -300,6 +247,9 @@ pub struct Runtime<B: Backend + Clone = SystemBackend> {
     poll_fds: Vec<libc::pollfd>,
     poll_owners: Vec<PollOwner>,
     ipc_sources: Vec<crate::ipc::PollSource>,
+    trace_writer: DiagnosticWriter,
+    diagnostic_writer: DiagnosticWriter,
+    metrics: wiiland_ipc::Diagnostics,
 }
 
 fn device_info<B: Backend + Clone>(dev: &BridgeDevice<B>) -> DeviceInfo {
@@ -341,6 +291,8 @@ impl Runtime<SystemBackend> {
 }
 impl<B: Backend + Clone> Runtime<B> {
     pub fn with_backend(config: Config, backend: B) -> Result<Self, i32> {
+        config.validate().map_err(|_| -libc::EINVAL)?;
+        let diagnostic_writer = DiagnosticWriter::stderr();
         Ok(Self {
             config,
             slots: std::array::from_fn(|_| None),
@@ -348,7 +300,7 @@ impl<B: Backend + Clone> Runtime<B> {
             signal: SignalPipe::install()?,
             backend,
             dry_run: false,
-            diagnostics: Diagnostics::stderr(),
+            diagnostics: Diagnostics::queued(&diagnostic_writer),
             trace: TraceConfig::default(),
             trace_sequence: Rc::new(Cell::new(0)),
             notification_sequence: Rc::new(Cell::new(0)),
@@ -356,6 +308,9 @@ impl<B: Backend + Clone> Runtime<B> {
             poll_fds: Vec::with_capacity(MAX_DEVICES + 2),
             poll_owners: Vec::with_capacity(MAX_DEVICES + 2),
             ipc_sources: Vec::new(),
+            trace_writer: DiagnosticWriter::stdout(),
+            diagnostic_writer,
+            metrics: wiiland_ipc::Diagnostics::default(),
         })
     }
     pub fn enable_ipc(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -414,12 +369,11 @@ impl<B: Backend + Clone> Runtime<B> {
         ) {
             Ok(mut dev) => {
                 if self.trace.enabled {
+                    let sender = self.trace_writer.sender();
                     dev.set_trace_sink_with_sequence(
                         self.trace.filter,
                         Rc::clone(&self.trace_sequence),
-                        |line| {
-                            println!("{}", line);
-                        },
+                        move |line| sender.send(line),
                     );
                 }
                 self.slots[slot] = Some(dev);
@@ -648,6 +602,7 @@ impl<B: Backend + Clone> Runtime<B> {
             return Ok(false);
         }
 
+        let dispatch_started = Instant::now();
         // Slots never move, so all device owners remain valid until this phase
         // is complete. Reconciliation is deliberately deferred below.
         for index in 0..self.poll_owners.len() {
@@ -697,8 +652,77 @@ impl<B: Backend + Clone> Runtime<B> {
                 }
             }
         }
+        self.service_commands();
+        self.metrics.max_dispatch_duration_us = self
+            .metrics
+            .max_dispatch_duration_us
+            .max(dispatch_started.elapsed().as_micros().min(u64::MAX as u128) as u64);
         Ok(false)
     }
+    fn control_command(
+        &mut self,
+        command: wiiland_ipc::Command,
+    ) -> Result<wiiland_ipc::ResponseResult, wiiland_ipc::ProtocolError> {
+        use wiiland_ipc::{Command, ProtocolError, ProtocolErrorCode, ResponseResult};
+        match command {
+            Command::Diagnostics => {
+                let mut metrics = self.metrics.clone();
+                metrics.trace_records_dropped = self.trace_writer.sender().dropped();
+                metrics.lifecycle_records_dropped = self.diagnostic_writer.sender().dropped();
+                Ok(ResponseResult::Diagnostics(metrics))
+            }
+            Command::Config => Ok(ResponseResult::Config(self.config.dump())),
+            Command::StartCapture { syspath } => {
+                let slot = self
+                    .find(Path::new(&syspath))
+                    .ok_or_else(|| ProtocolError {
+                        code: ProtocolErrorCode::InvalidRequest,
+                        message: "device is not owned by this daemon".into(),
+                    })?;
+                let device = self.slots[slot].as_mut().expect("found device");
+                device.set_capture(true).map_err(|code| ProtocolError {
+                    code: ProtocolErrorCode::Internal,
+                    message: format!("cannot open capture interfaces: {code}"),
+                })?;
+                Ok(ResponseResult::CaptureStarted(device_info(device)))
+            }
+            Command::StopCapture => Ok(ResponseResult::CaptureStopped),
+            _ => Err(ProtocolError {
+                code: ProtocolErrorCode::UnknownCommand,
+                message: "unsupported control command".into(),
+            }),
+        }
+    }
+
+    fn service_commands(&mut self) {
+        let commands = self
+            .ipc
+            .as_mut()
+            .map(IpcServer::take_commands)
+            .unwrap_or_default();
+        for (token, id, command) in commands {
+            let result = self.control_command(command);
+            if let Some(server) = self.ipc.as_mut() {
+                server.complete_command(token, id, result);
+            }
+        }
+        let captures = self
+            .ipc
+            .as_ref()
+            .map(IpcServer::capture_paths)
+            .unwrap_or_default();
+        for device in self.slots.iter_mut().flatten() {
+            let capture = captures.iter().any(|path| Path::new(path) == device.path());
+            if let Err(code) = device.set_capture(capture) {
+                self.diagnostics.emit(Lifecycle::Error {
+                    operation: "capture",
+                    path: Some(device.path()),
+                    code,
+                });
+            }
+        }
+    }
+
     fn loop_run(&mut self, single: bool) -> Result<(), i32> {
         let mut next_pointer = Instant::now() + POINTER_TICK;
         let mut next_reconcile = Instant::now() + RECONCILE_TICK;
@@ -718,10 +742,15 @@ impl<B: Backend + Clone> Runtime<B> {
             }
             let now = Instant::now();
             if now >= next_pointer {
+                self.metrics.max_pointer_lateness_us = self.metrics.max_pointer_lateness_us.max(
+                    now.duration_since(next_pointer)
+                        .as_micros()
+                        .min(u64::MAX as u128) as u64,
+                );
                 for slot in 0..MAX_DEVICES {
                     let active = self.slots[slot]
                         .as_ref()
-                        .is_some_and(|dev| dev.pointer.pointer_keys() != 0);
+                        .is_some_and(|dev| dev.pointer_active());
                     if active {
                         let result = self.slots[slot].as_mut().map(|dev| dev.tick_pointer());
                         if let Some(Err(code)) = result {
@@ -781,6 +810,7 @@ impl<B: Backend + Clone> Drop for Runtime<B> {
             slot.take();
         }
         self.monitor.take();
+        self.diagnostics.sink = Box::new(|_| {});
     }
 }
 
@@ -789,6 +819,38 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn hid_and_wire_event_codes_agree_for_every_report() {
+        let axis = Abs::default();
+        let key = HidButtonEvent {
+            button: Button::A,
+            state: ButtonState::Pressed,
+        };
+        let reports = [
+            EventKind::Key(key),
+            EventKind::Accel(axis),
+            EventKind::Ir([axis; 4]),
+            EventKind::BalanceBoard([axis; 4]),
+            EventKind::MotionPlus(axis),
+            EventKind::ProControllerKey(key),
+            EventKind::ProControllerMove([axis; 2]),
+            EventKind::Watch,
+            EventKind::ClassicControllerKey(key),
+            EventKind::ClassicControllerMove([axis; 3]),
+            EventKind::NunchukKey(key),
+            EventKind::NunchukMove([axis; 2]),
+            EventKind::DrumsKey(key),
+            EventKind::DrumsMove([axis; 8]),
+            EventKind::GuitarKey(key),
+            EventKind::GuitarMove([axis; 3]),
+            EventKind::Gone,
+        ];
+        for (code, report) in reports.into_iter().enumerate() {
+            assert_eq!(report.event_type().code(), code as u32);
+            assert_eq!(input_payload(report).event_code(), code as u32);
+        }
+    }
 
     #[test]
     fn empty_event_queue_does_not_remove_snapshot_devices() {

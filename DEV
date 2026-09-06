@@ -25,8 +25,8 @@ packages are:
 
 * `crates/wiiland-hid` — native Rust ownership, decoding, and control of
   devices exposed by Linux `hid-wiimote`; consumers use its root facade.
-* `crates/wiiland-core` — pure configuration, mapping, pointer, aim, and trace
-  logic.
+* `crates/wiiland-core` — deterministic event engine, configuration parser,
+  mapping, pointer, aim, and trace logic, plus a separate config I/O adapter.
 * `crates/wiilandd` — the `wiilandd` daemon and
   `wiilandd-hardware-report`.
 * `crates/wiiland-ipc` — source-level, `rlib`-only Rust DTOs and blocking
@@ -55,6 +55,9 @@ a stable Rust ABI or a C ABI.
 The daemon remains display-neutral: device ingestion and uinput output do not
 call a display-server API. The GUI's winit backend is selected by the active
 Wayland/X11 environment, while the TUI owns and restores its terminal.
+
+See `doc/ARCHITECTURE.md` for event processing, capture ownership, bounded
+diagnostics, and the additive IPC 1.1 commands.
 
 == Build ==
 

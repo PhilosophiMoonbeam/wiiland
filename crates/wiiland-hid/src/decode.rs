@@ -599,3 +599,70 @@ fn map_guitar_key(c: u16) -> Option<Button> {
         _ => return None,
     })
 }
+
+impl EventKind {
+    /// Readable interface that produced this report, absent for lifecycle events.
+    pub fn interface(self) -> Option<crate::model::InterfaceMask> {
+        use crate::model::InterfaceMask as M;
+        Some(match self {
+            Self::Key(_) => M::CORE,
+            Self::Accel(_) => M::ACCEL,
+            Self::Ir(_) => M::IR,
+            Self::BalanceBoard(_) => M::BALANCE_BOARD,
+            Self::MotionPlus(_) => M::MOTION_PLUS,
+            Self::ProControllerKey(_) | Self::ProControllerMove(_) => M::PRO_CONTROLLER,
+            Self::ClassicControllerKey(_) | Self::ClassicControllerMove(_) => M::CLASSIC_CONTROLLER,
+            Self::NunchukKey(_) | Self::NunchukMove(_) => M::NUNCHUK,
+            Self::DrumsKey(_) | Self::DrumsMove(_) => M::DRUMS,
+            Self::GuitarKey(_) | Self::GuitarMove(_) => M::GUITAR,
+            _ => return None,
+        })
+    }
+
+    pub const fn event_type(self) -> EventType {
+        match self {
+            EventKind::Key(_) => EventType::Key,
+            EventKind::Accel(_) => EventType::Accel,
+            EventKind::Ir(_) => EventType::Ir,
+            EventKind::BalanceBoard(_) => EventType::BalanceBoard,
+            EventKind::MotionPlus(_) => EventType::MotionPlus,
+            EventKind::ProControllerKey(_) => EventType::ProControllerKey,
+            EventKind::ProControllerMove(_) => EventType::ProControllerMove,
+            EventKind::Watch => EventType::Watch,
+            EventKind::ClassicControllerKey(_) => EventType::ClassicControllerKey,
+            EventKind::ClassicControllerMove(_) => EventType::ClassicControllerMove,
+            EventKind::NunchukKey(_) => EventType::NunchukKey,
+            EventKind::NunchukMove(_) => EventType::NunchukMove,
+            EventKind::DrumsKey(_) => EventType::DrumsKey,
+            EventKind::DrumsMove(_) => EventType::DrumsMove,
+            EventKind::GuitarKey(_) => EventType::GuitarKey,
+            EventKind::GuitarMove(_) => EventType::GuitarMove,
+            EventKind::Gone => EventType::Gone,
+            EventKind::Unknown(value) => EventType::Unknown(value),
+        }
+    }
+}
+impl EventType {
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Key => 0,
+            Self::Accel => 1,
+            Self::Ir => 2,
+            Self::BalanceBoard => 3,
+            Self::MotionPlus => 4,
+            Self::ProControllerKey => 5,
+            Self::ProControllerMove => 6,
+            Self::Watch => 7,
+            Self::ClassicControllerKey => 8,
+            Self::ClassicControllerMove => 9,
+            Self::NunchukKey => 10,
+            Self::NunchukMove => 11,
+            Self::DrumsKey => 12,
+            Self::DrumsMove => 13,
+            Self::GuitarKey => 14,
+            Self::GuitarMove => 15,
+            Self::Gone => 16,
+            Self::Unknown(value) => value,
+        }
+    }
+}

@@ -11,6 +11,7 @@ name = "wiiland-show"
 path = "src/main.rs"
 
 [dependencies]
+wiiland-ipc = { path = "../wiiland-ipc" }
 libc.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

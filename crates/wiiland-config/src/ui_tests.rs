@@ -247,7 +247,7 @@ fn capture_can_be_stopped_from_overview_with_log_hidden() {
     h.app.validation_task = Some(ValidationTask {
         kind: ValidationKind::Trace,
         cancel_requested: false,
-        process: ProcessTask::spawn("/bin/sleep", &["10".to_owned()]),
+        process: CaptureTask::Direct(ProcessTask::spawn("/bin/sleep", &["10".to_owned()])),
         calibration: None,
     });
     h.settle();
@@ -267,13 +267,13 @@ fn cancelled_calibration_releases_ownership_without_applying_values() {
     h.app.validation_task = Some(ValidationTask {
         kind: ValidationKind::Calibration,
         cancel_requested: true,
-        process: ProcessTask::spawn_capturing_stdout(
+        process: CaptureTask::Direct(ProcessTask::spawn_capturing_stdout(
             "/bin/sh",
             &[
                 "-c".to_owned(),
                 "printf 'aim-accel-zero-x=101\n'".to_owned(),
             ],
-        ),
+        )),
         calibration: Some(ownership),
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

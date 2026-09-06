@@ -54,8 +54,27 @@ struct ConfigTask {
 struct ValidationTask {
     kind: ValidationKind,
     cancel_requested: bool,
-    process: ProcessTask,
+    process: CaptureTask,
     calibration: Option<CalibrationOwnership>,
+}
+
+enum CaptureTask {
+    Direct(ProcessTask),
+    Daemon(Box<crate::live::Capture>),
+}
+impl CaptureTask {
+    fn terminate(&self) {
+        match self {
+            Self::Direct(task) => task.terminate(),
+            Self::Daemon(task) => task.cancel(),
+        }
+    }
+    fn poll(&mut self, model: &mut ConfigModel) -> Option<ProcessResult> {
+        match self {
+            Self::Direct(task) => poll_process(task, model),
+            Self::Daemon(task) => task.poll(model),
+        }
+    }
 }
 
 struct CalibrationOwnership {
@@ -112,11 +131,14 @@ pub struct ControlCenter {
     reload_confirmation: bool,
     close_approved: bool,
     service_status: String,
+    daemon_status: String,
     status: String,
     close_confirmation: bool,
     trace_device: String,
     trace_filter: String,
     trace_profile: Option<Profile>,
+    direct_capture: bool,
+    ipc_query: Option<crate::live::Query>,
 }
 
 impl ControlCenter {
@@ -136,11 +158,14 @@ impl ControlCenter {
             reload_confirmation: false,
             close_approved: false,
             service_status: "Checking…".to_owned(),
+            daemon_status: "Daemon status pending".to_owned(),
             status: "Ready".to_owned(),
             close_confirmation: false,
             trace_device: String::new(),
             trace_filter: "all".to_owned(),
             trace_profile: None,
+            direct_capture: false,
+            ipc_query: None,
         }
     }
 
@@ -148,6 +173,7 @@ impl ControlCenter {
         let mut application = Self::new(model);
         application.begin_load(false);
         application.service_action("is-active");
+        application.ipc_query = Some(crate::live::Query::start(false));
         application
     }
 
@@ -285,6 +311,13 @@ impl ControlCenter {
     }
 
     fn run_command(&mut self, args: Vec<String>, config_sensitive: bool) {
+        if args.first().is_some_and(|arg| arg == "--list") {
+            if self.ipc_query.is_none() {
+                self.ipc_query = Some(crate::live::Query::start(true));
+            }
+            self.output_open = true;
+            return;
+        }
         if self.command_task.is_some() {
             return;
         }
@@ -395,6 +428,7 @@ impl ControlCenter {
         }
         let mut args = vec![
             "--dry-run".to_owned(),
+            "--no-ipc".to_owned(),
             format!("--trace-events={}", self.trace_filter),
             "--verbose".to_owned(),
         ];
@@ -413,12 +447,24 @@ impl ControlCenter {
             args,
         );
         let command = self.model.daemon_program().to_owned();
-        self.model
-            .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
+        if self.direct_capture {
+            self.model
+                .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
+        }
         self.validation_task = Some(ValidationTask {
             kind: ValidationKind::Trace,
             cancel_requested: false,
-            process: ProcessTask::spawn(command, &args),
+            process: if self.direct_capture {
+                CaptureTask::Direct(ProcessTask::spawn(command, &args))
+            } else {
+                CaptureTask::Daemon(Box::new(crate::live::Capture::start(
+                    self.trace_device.trim().to_owned(),
+                    self.trace_filter
+                        .parse()
+                        .unwrap_or(wiiland_core::TraceFilter::All),
+                    None,
+                )))
+            },
             calibration: None,
         });
         self.output_open = true;
@@ -449,12 +495,24 @@ impl ControlCenter {
             args,
         );
         let command = transaction.daemon_program.clone();
-        self.model
-            .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
+        if self.direct_capture {
+            self.model
+                .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
+        }
         self.validation_task = Some(ValidationTask {
             kind: ValidationKind::Calibration,
             cancel_requested: false,
-            process: ProcessTask::spawn_capturing_stdout(command, &args),
+            process: if self.direct_capture {
+                CaptureTask::Direct(ProcessTask::spawn_capturing_stdout(command, &args))
+            } else {
+                CaptureTask::Daemon(Box::new(crate::live::Capture::start(
+                    device.clone(),
+                    wiiland_core::TraceFilter::All,
+                    Some(Duration::from_secs(
+                        transaction.captured.aim_calibration_duration as u64,
+                    )),
+                )))
+            },
             calibration: Some(CalibrationOwnership {
                 transaction,
                 device,
@@ -473,10 +531,10 @@ impl ControlCenter {
     }
 
     fn poll_validation(&mut self) {
-        let Some(task) = self.validation_task.as_ref() else {
+        let Some(task) = self.validation_task.as_mut() else {
             return;
         };
-        let result = match poll_process(&task.process, &mut self.model) {
+        let result = match task.process.poll(&mut self.model) {
             Some(result) => result,
             None => return,
         };
@@ -634,7 +692,7 @@ impl ControlCenter {
                 }
                 theme::note(ui, &format!("Window system: {}", Self::backend_name()));
             });
-            if ui.add_enabled(self.config_task.is_none(), egui::Button::new("Reload from daemon")).clicked() {
+            if ui.add_enabled(self.config_task.is_none(), egui::Button::new("Reload saved settings")).clicked() {
                 self.request_reload();
             }
         });
@@ -644,6 +702,11 @@ impl ControlCenter {
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.heading("Background service");
+            theme::note(ui, &self.daemon_status);
+            if ui.add_enabled(self.ipc_query.is_none(), egui::Button::new("Refresh daemon status")).clicked() {
+                self.ipc_query = Some(crate::live::Query::start(false));
+                self.output_open = true;
+            }
             ui.horizontal_wrapped(|ui| {
                 if self.service_task.is_some() {
                     ui.spinner();
@@ -747,7 +810,7 @@ impl ControlCenter {
         ui.horizontal_wrapped(|ui| {
             theme::badge(ui, if self.model.dirty { "Unsaved changes" } else { "No pending edits" }, self.model.dirty);
             if busy { ui.spinner(); }
-            if ui.add_enabled(!busy, egui::Button::new("Reload")).on_hover_text("Reload effective configuration from the daemon.").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("Reload")).on_hover_text("Reload saved configuration from disk.").clicked() {
                 self.request_reload();
             }
             if ui.add_enabled(!busy && valid, egui::Button::new("Validate and save")).clicked() {
@@ -776,7 +839,8 @@ impl ControlCenter {
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.heading("Live input trace");
-            theme::note(ui, "Test buttons and movement without emitting virtual input. Traces use your saved settings.");
+            theme::note(ui, "Capture sensors from the running daemon. Its virtual input remains active. Calibration uses the first controller when no selector is given.");
+            ui.add_enabled(!active, egui::Checkbox::new(&mut self.direct_capture, "Direct hardware diagnostics (service must be stopped)"));
             ui.add_enabled_ui(!active, |ui| {
                 field_row(ui, "Controller", |ui, label_id| {
                     ui.add(egui::TextEdit::singleline(&mut self.trace_device)
@@ -789,14 +853,14 @@ impl ControlCenter {
                         ("all", "All events"), ("keys", "Buttons"), ("axes", "Axes"), ("ir", "IR sensor"), ("motion-plus", "MotionPlus"),
                     ]).labelled_by(label_id).changed()
                 });
-                field_row(ui, "Temporary profile", |ui, label_id| {
+                if self.direct_capture { field_row(ui, "Temporary profile", |ui, label_id| {
                     let mut token = self.trace_profile.and_then(|p| p.as_str()).unwrap_or("").to_owned();
                     let response = combo_token(ui, "trace-profile", &mut token, &[
                         ("", "Use saved configuration"), ("gamepad", "Gamepad"), ("desktop", "Desktop"), ("both", "Gamepad + desktop"),
                     ]).labelled_by(label_id);
                     self.trace_profile = Profile::parse(&token);
                     response.changed()
-                });
+                }); }
             });
             ui.horizontal_wrapped(|ui| {
                 if theme::primary(ui, "Start trace", !active).clicked() { self.start_trace(); }
@@ -1068,11 +1132,29 @@ impl eframe::App for ControlCenter {
         self.poll_command();
         self.poll_service();
         self.poll_validation();
+        if let Some(result) = self.ipc_query.as_ref().and_then(crate::live::Query::poll) {
+            if self
+                .ipc_query
+                .as_ref()
+                .is_some_and(crate::live::Query::is_status)
+            {
+                self.daemon_status = match &result {
+                    Ok(text) => text.lines().next().unwrap_or("Daemon connected").to_owned(),
+                    Err(_) => "Daemon unavailable · see activity log".to_owned(),
+                };
+            }
+            self.ipc_query = None;
+            match result {
+                Ok(text) => self.model.append_output(&text),
+                Err(error) => self.model.append_output(&format!("{error}\n")),
+            }
+        }
         self.draw(ctx);
         let busy = self.config_task.is_some()
             || self.command_task.is_some()
             || self.service_task.is_some()
-            || self.validation_task.is_some();
+            || self.validation_task.is_some()
+            || self.ipc_query.is_some();
         ctx.request_repaint_after(Duration::from_millis(if busy { 40 } else { 250 }));
     }
 }

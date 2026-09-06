@@ -145,3 +145,13 @@ fn axis_values_remain_owned_and_three_dimensional() {
     let axis = Axis3 { x: -1, y: 2, z: 3 };
     assert_eq!((axis.x, axis.y, axis.z), (-1, 2, 3));
 }
+
+#[test]
+fn logical_button_codes_round_trip_in_the_public_facade() {
+    for (code, button) in wiiland_hid::Button::ALL.into_iter().enumerate() {
+        assert_eq!(button.code(), code as u32);
+        assert_eq!(wiiland_hid::Button::from_code(code as u32), Some(button));
+    }
+    assert_eq!(wiiland_hid::Button::from_code(28), None);
+    assert_eq!(wiiland_hid::Button::from_code(u32::MAX), None);
+}

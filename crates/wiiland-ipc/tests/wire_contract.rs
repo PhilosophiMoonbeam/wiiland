@@ -37,7 +37,7 @@ fn axes<const N: usize>() -> [Axis3; N] {
 #[test]
 fn protocol_one_hello_request_and_correlated_response_error_have_exact_shapes() {
     assert_eq!(wiiland_ipc::PROTOCOL_MAJOR, 1);
-    assert_eq!(wiiland_ipc::PROTOCOL_MINOR, 0);
+    assert_eq!(wiiland_ipc::PROTOCOL_MINOR, 1);
 
     let request = Request {
         id: 41,
@@ -530,3 +530,28 @@ fn frame_buffer_handles_lf_and_crlf_using_public_api() {
 }
 
 const BTN_A: u32 = 304;
+
+#[test]
+fn minor_one_controls_are_additive_and_have_exact_wire_shapes() {
+    assert_wire(&Command::Diagnostics, json!({"type":"diagnostics"}));
+    assert_wire(&Command::Config, json!({"type":"config"}));
+    assert_wire(
+        &Command::StartCapture {
+            syspath: "/sys/test".into(),
+        },
+        json!({"type":"start_capture","syspath":"/sys/test"}),
+    );
+    assert_wire(&Command::StopCapture, json!({"type":"stop_capture"}));
+    assert_wire(
+        &ResponseResult::Config("profile=gamepad\n".into()),
+        json!({"type":"config","value":"profile=gamepad\n"}),
+    );
+    assert_wire(
+        &ResponseResult::CaptureStopped,
+        json!({"type":"capture_stopped"}),
+    );
+    assert_wire(
+        &ResponseResult::Diagnostics(wiiland_ipc::Diagnostics::default()),
+        json!({"type":"diagnostics","value":{"trace_records_dropped":0,"lifecycle_records_dropped":0,"max_pointer_lateness_us":0,"max_dispatch_duration_us":0}}),
+    );
+}

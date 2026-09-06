@@ -6,7 +6,9 @@ use std::{error::Error, fmt};
 /// Protocol major version.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor version.
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
+/// Maximum sensor capture leases per connection.
+pub const MAX_CAPTURE_DEVICES: usize = 32;
 /// Maximum JSON frame size, excluding its delimiter.
 pub const MAX_FRAME_BYTES: usize = 65_536;
 
@@ -27,6 +29,13 @@ pub enum Command {
         max_major: u16,
     },
     Ping,
+    Diagnostics,
+    Config,
+    /// Lease all readable sensor interfaces until StopCapture or disconnect.
+    StartCapture {
+        syspath: String,
+    },
+    StopCapture,
     Status,
     Devices,
     Subscribe {
@@ -66,6 +75,10 @@ pub enum ResponseResult {
         daemon_version: String,
     },
     Pong,
+    Diagnostics(Diagnostics),
+    Config(String),
+    CaptureStarted(DeviceInfo),
+    CaptureStopped,
     Status(Status),
     Devices(Vec<DeviceInfo>),
     Subscribed,
@@ -126,6 +139,15 @@ pub struct Status {
     pub device_count: u32,
     pub dry_run: bool,
     pub socket_path: String,
+}
+
+/// Reactor health counters, sampled without blocking device ingestion.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Diagnostics {
+    pub trace_records_dropped: u64,
+    pub lifecycle_records_dropped: u64,
+    pub max_pointer_lateness_us: u64,
+    pub max_dispatch_duration_us: u64,
 }
 
 /// Information about an opened or known device.
@@ -256,6 +278,33 @@ pub enum InputPayload {
     Unknown(u32),
     #[serde(other)]
     Unsupported,
+}
+
+impl InputPayload {
+    /// Stable event number used by the trace contract.
+    pub fn event_code(&self) -> u32 {
+        match self {
+            Self::Key(_) => 0,
+            Self::Accel(_) => 1,
+            Self::Ir(_) => 2,
+            Self::BalanceBoard(_) => 3,
+            Self::MotionPlus(_) => 4,
+            Self::ProControllerKey(_) => 5,
+            Self::ProControllerMove(_) => 6,
+            Self::Watch => 7,
+            Self::ClassicControllerKey(_) => 8,
+            Self::ClassicControllerMove(_) => 9,
+            Self::NunchukKey(_) => 10,
+            Self::NunchukMove(_) => 11,
+            Self::DrumsKey(_) => 12,
+            Self::DrumsMove(_) => 13,
+            Self::GuitarKey(_) => 14,
+            Self::GuitarMove(_) => 15,
+            Self::Gone => 16,
+            Self::Unknown(value) => *value,
+            Self::Unsupported => u32::MAX,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for InputPayload {

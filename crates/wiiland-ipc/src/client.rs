@@ -17,11 +17,28 @@ const MAX_NOTIFICATION_BACKLOG_BYTES: usize = 256 * 1024;
 pub enum ClientError {
     Io(io::Error),
     Frame(FrameError),
-    Server { error: ProtocolError },
-    UnexpectedResponseId { expected: u64, actual: u64 },
+    Server {
+        error: ProtocolError,
+    },
+    UnexpectedResponseId {
+        expected: u64,
+        actual: u64,
+    },
     UnexpectedMessage,
-    UnsupportedVersion { major: u16, minor: u16 },
-    NotificationBacklogExceeded { limit: usize },
+    UnsupportedVersion {
+        major: u16,
+        minor: u16,
+    },
+    NotificationBacklogExceeded {
+        limit: usize,
+    },
+    SessionBacklogExceeded {
+        limit: usize,
+    },
+    UnsupportedFeature {
+        peer_minor: u16,
+        required_minor: u16,
+    },
     PrematureEof,
     RuntimeDirectoryMissing,
     RuntimeDirectoryRelative(PathBuf),
@@ -49,6 +66,17 @@ impl std::fmt::Display for ClientError {
                     "IPC notification backlog exceeded the {limit}-byte limit"
                 )
             }
+            Self::SessionBacklogExceeded { limit } => write!(
+                f,
+                "IPC session exceeded its {limit}-event queue; reconnect to resume"
+            ),
+            Self::UnsupportedFeature {
+                peer_minor,
+                required_minor,
+            } => write!(
+                f,
+                "operation requires daemon protocol 1.{required_minor}; connected daemon provides 1.{peer_minor}"
+            ),
             Self::PrematureEof => f.write_str("IPC peer closed the connection"),
             Self::RuntimeDirectoryMissing => f.write_str("XDG_RUNTIME_DIR is not set"),
             Self::RuntimeDirectoryRelative(path) => {
@@ -82,6 +110,7 @@ pub struct Client {
     messages: VecDeque<(ServerMessage, usize)>,
     terminated: bool,
     next_id: u64,
+    protocol_minor: u16,
 }
 
 impl Client {
@@ -89,6 +118,8 @@ impl Client {
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = path.as_ref().to_path_buf();
         let stream = UnixStream::connect(&path)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let mut client = Self {
             stream,
             socket_path: path,
@@ -98,8 +129,11 @@ impl Client {
             messages: VecDeque::new(),
             terminated: false,
             next_id: 1,
+            protocol_minor: 0,
         };
         client.hello()?;
+        client.set_read_timeout(None)?;
+        client.set_write_timeout(None)?;
         Ok(client)
     }
 
@@ -176,6 +210,41 @@ impl Client {
         }
     }
 
+    /// Request reactor timing and diagnostic loss counters (protocol 1.1).
+    pub fn diagnostics(&mut self) -> Result<crate::Diagnostics, ClientError> {
+        self.require_minor(1)?;
+        match self.request(Command::Diagnostics)? {
+            ResponseResult::Diagnostics(value) => Ok(value),
+            _ => Err(ClientError::UnexpectedMessage),
+        }
+    }
+    /// Return the running daemon's validated configuration, in canonical text form.
+    pub fn config(&mut self) -> Result<String, ClientError> {
+        self.require_minor(1)?;
+        match self.request(Command::Config)? {
+            ResponseResult::Config(value) => Ok(value),
+            _ => Err(ClientError::UnexpectedMessage),
+        }
+    }
+    /// Open additional sensors for this connection. Subscribe before capturing.
+    /// Up to 32 devices may be leased; stop_capture releases every lease.
+    pub fn start_capture(&mut self, syspath: &str) -> Result<DeviceInfo, ClientError> {
+        self.require_minor(1)?;
+        match self.request(Command::StartCapture {
+            syspath: syspath.to_owned(),
+        })? {
+            ResponseResult::CaptureStarted(value) => Ok(value),
+            _ => Err(ClientError::UnexpectedMessage),
+        }
+    }
+    pub fn stop_capture(&mut self) -> Result<(), ClientError> {
+        self.require_minor(1)?;
+        match self.request(Command::StopCapture)? {
+            ResponseResult::CaptureStopped => Ok(()),
+            _ => Err(ClientError::UnexpectedMessage),
+        }
+    }
+
     /// Return the next queued notification, blocking until one is available.
     pub fn next_event(&mut self) -> Result<Notification, ClientError> {
         self.ensure_active()?;
@@ -190,6 +259,20 @@ impl Client {
         }
     }
 
+    pub fn protocol_version(&self) -> (u16, u16) {
+        (PROTOCOL_MAJOR, self.protocol_minor)
+    }
+    fn require_minor(&self, required_minor: u16) -> Result<(), ClientError> {
+        if self.protocol_minor < required_minor {
+            Err(ClientError::UnsupportedFeature {
+                peer_minor: self.protocol_minor,
+                required_minor,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     fn hello(&mut self) -> Result<(), ClientError> {
         match self.request(Command::Hello {
             min_major: PROTOCOL_MAJOR,
@@ -197,9 +280,12 @@ impl Client {
         })? {
             ResponseResult::Hello {
                 major,
-                minor: _,
+                minor,
                 daemon_version: _,
-            } if major == PROTOCOL_MAJOR => Ok(()),
+            } if major == PROTOCOL_MAJOR => {
+                self.protocol_minor = minor;
+                Ok(())
+            }
             ResponseResult::Hello { major, minor, .. } => {
                 Err(ClientError::UnsupportedVersion { major, minor })
             }

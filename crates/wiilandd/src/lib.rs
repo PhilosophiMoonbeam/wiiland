@@ -7,6 +7,7 @@
 pub mod bridge;
 pub mod cli;
 pub mod commands;
+mod diagnostics;
 mod ipc;
 pub mod report;
 pub mod runtime;

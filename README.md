@@ -234,7 +234,9 @@ wiiland-config
 `wiiland-config` uses egui with native winit Wayland/X11 backends and application
 ID `io.github.philosophimoonbeam.wiiland-config`; no toolkit-specific platform
 override is required. The control center edits and validates configuration,
-manages the user service, and runs device traces and calibration capture.
+manages the user service, and captures live input and calibration samples through
+the running daemon. Live capture keeps normal virtual input active; the explicit
+direct-hardware diagnostic mode requires stopping the service first.
 Its pearl and dusk themes carry the logo's sea-glass palette into focused settings
 pages, with persistent save controls and an expandable activity log. Appearance
 follows the system by default; you can also select either palette explicitly.
@@ -244,7 +246,18 @@ follows the system by default; you can also select either palette explicitly.
 </p>
 
 The optional `wiiland-show` diagnostic uses ratatui/crossterm and restores the
-terminal on exit.
+terminal on exit. It uses the running daemon by default:
+
+```sh
+wiiland-show list
+wiiland-show 1
+wiiland-show --socket /absolute/private/wiilandd.sock 1
+```
+
+Use `--direct` after stopping the daemon for hardware controls such as LEDs,
+rumble, and normalization. In daemon mode, `q` quits and `f` freezes the display.
+Both frontend capture paths require daemon protocol 1.1 or newer; existing
+protocol 1.0 status and subscription clients remain supported.
 
 ## Configure
 
@@ -374,6 +387,7 @@ device type, session, and consumer results.
 - [`doc/wiilandd.1`](doc/wiilandd.1) — daemon and command reference
 - [`doc/wiiland-config.1`](doc/wiiland-config.1) — control center reference
 - [`doc/wiiland.7`](doc/wiiland.7) — installed overview
+- [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) — processing boundaries, capture leases, and IPC 1.1
 - [`doc/DEVICES`](doc/DEVICES) and [`doc/PROTOCOL`](doc/PROTOCOL) — hardware model and archival protocol notes
 - [`DEV`](DEV) — contributor build and packaging notes
 

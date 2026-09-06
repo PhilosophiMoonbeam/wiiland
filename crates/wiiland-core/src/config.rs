@@ -1,5 +1,4 @@
 use std::fmt;
-use std::fs;
 use std::io;
 use std::ops::{BitOr, BitOrAssign};
 use std::path::{Path, PathBuf};
@@ -388,7 +387,7 @@ impl ConfigError {
             source: None,
         }
     }
-    fn io(path: &Path, source: io::Error) -> Self {
+    pub(crate) fn io(path: &Path, source: io::Error) -> Self {
         Self {
             path: path.to_path_buf(),
             line: None,
@@ -424,96 +423,16 @@ impl std::error::Error for ConfigError {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, ConfigError> {
-        Self::load_default_layers()
+    /// Parse one complete configuration without consulting the filesystem or environment.
+    pub fn parse_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> Result<Self, ConfigError> {
+        let mut config = Self::default();
+        config.apply_bytes(path.as_ref(), bytes)?;
+        config.validate()?;
+        Ok(config)
     }
-    pub fn load_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let mut c = Self::default();
-        c.read_file(path.as_ref(), true)?;
-        c.validate()?;
-        Ok(c)
-    }
-    pub fn load_layers(
-        system: Option<impl AsRef<Path>>,
-        user: Option<impl AsRef<Path>>,
-        explicit: Option<impl AsRef<Path>>,
-    ) -> Result<Self, ConfigError> {
-        let mut c = Self::default();
-        if let Some(path) = explicit {
-            c.read_file(path.as_ref(), true)?;
-        } else {
-            if let Some(path) = system {
-                c.read_file(path.as_ref(), false)?;
-            }
-            if let Some(path) = user {
-                c.read_file(path.as_ref(), false)?;
-            }
-        }
-        c.validate()?;
-        Ok(c)
-    }
-    pub fn profile_for_device(&self, syspath: Option<&str>, devtype: Option<&str>) -> Profile {
-        let mut selected = self.profile;
-        for rule in &self.device_rules {
-            let matched = match rule.kind {
-                DeviceRuleKind::Syspath => {
-                    syspath.is_some_and(|path| path.contains(&rule.match_text))
-                }
-                DeviceRuleKind::Devtype => {
-                    devtype.is_some_and(|kind| kind.contains(&rule.match_text))
-                }
-            };
-            if matched {
-                selected = rule.profile;
-            }
-        }
-        selected
-    }
-    pub fn profile_for_syspath(&self, syspath: &str) -> Profile {
-        self.profile_for_device(Some(syspath), None)
-    }
-    pub fn load_default_layers() -> Result<Self, ConfigError> {
-        let user = user_config_path();
-        Self::load_layers(
-            Some(Path::new(SYSTEM_CONFIG_PATH)),
-            user.as_deref(),
-            Option::<&Path>::None,
-        )
-    }
-    pub fn apply_line(
-        &mut self,
-        path: impl AsRef<Path>,
-        line_no: usize,
-        line: &str,
-    ) -> Result<(), ConfigError> {
-        let path = path.as_ref().to_string_lossy();
-        let bytes = line.as_bytes();
-        if bytes.len() > MAX_LINE_BYTES - 1 {
-            return Err(ConfigError::line(&path, line_no, "line too long".into()));
-        }
-        let content = line.split('#').next().unwrap_or("");
-        let content = content.trim_matches(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n');
-        if content.is_empty() {
-            return Ok(());
-        }
-        let Some(eq) = content.find('=') else {
-            return Err(ConfigError::line(
-                &path,
-                line_no,
-                "expected key=value".into(),
-            ));
-        };
-        let key = content[..eq].trim_matches(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n');
-        let value =
-            content[eq + 1..].trim_matches(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n');
-        self.set_key(&path, line_no, key, value)
-    }
-    fn read_file(&mut self, path: &Path, required: bool) -> Result<(), ConfigError> {
-        let bytes = match fs::read(path) {
-            Ok(v) => v,
-            Err(e) if !required && e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(ConfigError::io(path, e)),
-        };
+
+    /// Apply a layer; validation is deferred until all layers have been applied.
+    pub fn apply_bytes(&mut self, path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
         let mut start = 0;
         let mut no = 1;
         for (i, b) in bytes.iter().enumerate() {
@@ -549,6 +468,54 @@ impl Config {
             self.apply_line(path, no, text)?;
         }
         Ok(())
+    }
+    pub fn profile_for_device(&self, syspath: Option<&str>, devtype: Option<&str>) -> Profile {
+        let mut selected = self.profile;
+        for rule in &self.device_rules {
+            let matched = match rule.kind {
+                DeviceRuleKind::Syspath => {
+                    syspath.is_some_and(|path| path.contains(&rule.match_text))
+                }
+                DeviceRuleKind::Devtype => {
+                    devtype.is_some_and(|kind| kind.contains(&rule.match_text))
+                }
+            };
+            if matched {
+                selected = rule.profile;
+            }
+        }
+        selected
+    }
+    pub fn profile_for_syspath(&self, syspath: &str) -> Profile {
+        self.profile_for_device(Some(syspath), None)
+    }
+    pub fn apply_line(
+        &mut self,
+        path: impl AsRef<Path>,
+        line_no: usize,
+        line: &str,
+    ) -> Result<(), ConfigError> {
+        let path = path.as_ref().to_string_lossy();
+        let bytes = line.as_bytes();
+        if bytes.len() > MAX_LINE_BYTES - 1 {
+            return Err(ConfigError::line(&path, line_no, "line too long".into()));
+        }
+        let content = line.split('#').next().unwrap_or("");
+        let content = content.trim_matches(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n');
+        if content.is_empty() {
+            return Ok(());
+        }
+        let Some(eq) = content.find('=') else {
+            return Err(ConfigError::line(
+                &path,
+                line_no,
+                "expected key=value".into(),
+            ));
+        };
+        let key = content[..eq].trim_matches(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n');
+        let value =
+            content[eq + 1..].trim_matches(|c| c == ' ' || c == '\t' || c == '\r' || c == '\n');
+        self.set_key(&path, line_no, key, value)
     }
     fn invalid(path: &str, line: usize, key: &str) -> ConfigError {
         ConfigError::line(path, line, format!("invalid value for '{}'", key))
@@ -874,20 +841,20 @@ fn parse_int(v: &str, min: i32, max: i32) -> Option<i32> {
         Some(n as i32)
     }
 }
-fn user_config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| Path::new(v).is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| Path::new(v).is_absolute())
-                .map(|v| {
-                    let mut p = PathBuf::from(v);
-                    p.push(".config");
-                    p.into_os_string()
-                })
-        })?;
-    let mut p = PathBuf::from(base);
-    p.push("wiiland");
-    p.push("wiilandd.conf");
-    Some(p)
+
+/// A validated snapshot. Mutable drafts remain ordinary `Config` values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedConfig(Config);
+
+impl TryFrom<Config> for ValidatedConfig {
+    type Error = ConfigError;
+    fn try_from(config: Config) -> Result<Self, Self::Error> {
+        config.validate()?;
+        Ok(Self(config))
+    }
+}
+impl ValidatedConfig {
+    pub fn get(&self) -> &Config {
+        &self.0
+    }
 }

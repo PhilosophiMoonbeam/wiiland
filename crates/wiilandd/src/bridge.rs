@@ -4,17 +4,15 @@ use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use wiiland_core::aim::{AimConfig, AimState};
-use wiiland_core::mapping::{self, Abs3, MotionKind};
-use wiiland_core::pointer::{
-    IrFrame, IrPoint, POINTER_DOWN, POINTER_LEFT, POINTER_RIGHT, POINTER_UP, PointerState,
+use wiiland_core::engine::{
+    DeviceEngine, EngineInput, OutputAction, OutputDevice, needs_desktop, needs_gamepad,
 };
+use wiiland_core::mapping::{Abs3, MotionKind};
+use wiiland_core::pointer::{IrFrame, IrPoint};
 use wiiland_core::{
     AbsPayload, Config, KeyPayload, Profile, TraceEvent, TraceFilter, TracePayload,
 };
-use wiiland_hid::{
-    Axis3, Button, ButtonEvent, ButtonState, Event, EventKind, Interface, InterfaceMask,
-};
+use wiiland_hid::{Axis3, Button, ButtonState, Event, EventKind, Interface, InterfaceMask};
 
 pub const MAX_EVENTS_PER_DRAIN: usize = 256;
 pub const PROFILE_GAMEPAD: u8 = Profile::GAMEPAD.bits();
@@ -25,70 +23,15 @@ fn io_errno(error: &io::Error) -> i32 {
 }
 
 fn button_code(button: Button) -> Option<u32> {
-    Some(match button {
-        Button::Left => 0,
-        Button::Right => 1,
-        Button::Up => 2,
-        Button::Down => 3,
-        Button::Plus => 6,
-        Button::Minus => 7,
-        Button::One => 9,
-        Button::Two => 10,
-        Button::A => 4,
-        Button::B => 5,
-        Button::Home => 8,
-        Button::C => 19,
-        Button::Z => 20,
-        Button::X => 11,
-        Button::Y => 12,
-        Button::ShoulderLeft => 13,
-        Button::ShoulderRight => 14,
-        Button::TriggerLeft => 15,
-        Button::TriggerRight => 16,
-        Button::ThumbLeft => 17,
-        Button::ThumbRight => 18,
-        Button::StrumBarUp => 21,
-        Button::StrumBarDown => 22,
-        Button::FretFarUp => 23,
-        Button::FretUp => 24,
-        Button::FretMid => 25,
-        Button::FretLow => 26,
-        Button::FretFarLow => 27,
-        _ => return None,
-    })
+    Some(button.code())
 }
 
 fn button_state(state: ButtonState) -> Option<u32> {
-    match state {
-        ButtonState::Released => Some(0),
-        ButtonState::Pressed => Some(1),
-        ButtonState::Repeated => Some(2),
-        _ => None,
-    }
+    Some(state.value())
 }
 
 fn event_type_code(kind: EventKind) -> u32 {
-    match kind {
-        EventKind::Key(_) => 0,
-        EventKind::Accel(_) => 1,
-        EventKind::Ir(_) => 2,
-        EventKind::BalanceBoard(_) => 3,
-        EventKind::MotionPlus(_) => 4,
-        EventKind::ProControllerKey(_) => 5,
-        EventKind::ProControllerMove(_) => 6,
-        EventKind::Watch => 7,
-        EventKind::ClassicControllerKey(_) => 8,
-        EventKind::ClassicControllerMove(_) => 9,
-        EventKind::NunchukKey(_) => 10,
-        EventKind::NunchukMove(_) => 11,
-        EventKind::DrumsKey(_) => 12,
-        EventKind::DrumsMove(_) => 13,
-        EventKind::GuitarKey(_) => 14,
-        EventKind::GuitarMove(_) => 15,
-        EventKind::Gone => 16,
-        EventKind::Unknown(value) => value,
-        _ => u32::MAX,
-    }
+    kind.event_type().code()
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum BridgeAction {
@@ -133,7 +76,7 @@ impl TraceContext {
         if !self.filter.matches(event_type_code(event.kind)) {
             return;
         }
-        let sequence = self.sequence.get() + 1;
+        let sequence = self.sequence.get().wrapping_add(1).max(1);
         self.sequence.set(sequence);
         let monotonic_us = (self.clock)();
         let line = format_trace_line(sequence, monotonic_us, syspath, event);
@@ -142,19 +85,20 @@ impl TraceContext {
 }
 
 pub struct BridgeDevice<B: Backend + Clone = crate::uinput::SystemBackend> {
-    pub syspath: PathBuf,
-    pub profile: Profile,
-    pub iface: Interface,
-    pub gamepad: Option<VirtualDevice<B>>,
-    pub desktop: Option<VirtualDevice<B>>,
-    pub pointer: PointerState,
-    pub aim: AimState,
-    pub opened_ifaces: InterfaceMask,
-    pub pending_ifaces: InterfaceMask,
+    pub(crate) syspath: PathBuf,
+    pub(crate) profile: Profile,
+    pub(crate) iface: Interface,
+    pub(crate) gamepad: Option<VirtualDevice<B>>,
+    pub(crate) desktop: Option<VirtualDevice<B>>,
+    engine: DeviceEngine,
+    actions: Vec<OutputAction>,
+    pub(crate) opened_ifaces: InterfaceMask,
+    pub(crate) pending_ifaces: InterfaceMask,
     trace: Option<TraceContext>,
     config: Config,
     backend: B,
     outputs_enabled: bool,
+    capture: bool,
 }
 impl BridgeDevice<crate::uinput::SystemBackend> {
     pub fn new(path: impl AsRef<Path>, config: &Config) -> Result<Self, i32> {
@@ -171,6 +115,7 @@ impl<B: Backend + Clone> BridgeDevice<B> {
         backend: B,
         outputs_enabled: bool,
     ) -> Result<Self, i32> {
+        let validated = config.clone().try_into().map_err(|_| -libc::EINVAL)?;
         let iface = Interface::new(path.as_ref()).map_err(|error| io_errno(&error))?;
         let syspath = iface.syspath().to_path_buf();
         let devtype = iface.attr("devtype").ok();
@@ -197,20 +142,15 @@ impl<B: Backend + Clone> BridgeDevice<B> {
             iface,
             gamepad,
             desktop,
-            pointer: PointerState::new(
-                config.pointer_speed,
-                config.ir_speed,
-                config.ir_deadzone,
-                config.ir_smoothing,
-                config.ir_tracking,
-            ),
-            aim: AimState::new(AimConfig::from_config(config)),
+            engine: DeviceEngine::new(validated, profile),
+            actions: Vec::with_capacity(32),
             opened_ifaces: opened,
             pending_ifaces: pending,
             trace: None,
             config: config.clone(),
             backend,
             outputs_enabled,
+            capture: false,
         })
     }
     pub fn set_trace_sink<F: FnMut(&str) + 'static>(&mut self, filter: TraceFilter, sink: F) {
@@ -226,6 +166,24 @@ impl<B: Backend + Clone> BridgeDevice<B> {
     }
     pub fn path(&self) -> &Path {
         &self.syspath
+    }
+    fn requested_interfaces(&self) -> InterfaceMask {
+        if self.capture {
+            InterfaceMask::ALL
+        } else {
+            requested_interfaces(self.profile, &self.config)
+        }
+    }
+    pub(crate) fn set_capture(&mut self, enabled: bool) -> Result<(), i32> {
+        if enabled == self.capture {
+            return Ok(());
+        }
+        self.capture = enabled;
+        let desired = self.requested_interfaces();
+        self.iface.close(self.iface.opened() & !desired);
+        self.opened_ifaces = self.iface.opened();
+        self.pending_ifaces = desired & !self.opened_ifaces;
+        self.retry_open()
     }
     pub fn retry_open(&mut self) -> Result<(), i32> {
         if self.pending_ifaces.is_empty() {
@@ -251,16 +209,15 @@ impl<B: Backend + Clone> BridgeDevice<B> {
     }
     pub fn handle_watch(&mut self) -> Result<(), i32> {
         let opened = self.iface.opened();
-        let lost = self.opened_ifaces & !opened;
+        let lost = self.opened_ifaces & !opened & requested_interfaces(self.profile, &self.config);
         if !lost.is_empty() {
             self.gamepad.take();
             self.desktop.take();
-            self.pointer.reset();
-            self.aim.reset();
+            self.engine.process(EngineInput::Reset, &mut self.actions);
             self.recreate_outputs()?;
         }
         self.opened_ifaces = opened;
-        self.pending_ifaces = requested_interfaces(self.profile, &self.config) & !opened;
+        self.pending_ifaces = self.requested_interfaces() & !opened;
         self.retry_open()
     }
     fn recreate_outputs(&mut self) -> Result<(), i32> {
@@ -307,209 +264,98 @@ impl<B: Backend + Clone> BridgeDevice<B> {
     pub fn handle_event(&mut self, event: &Event) -> Result<BridgeAction, i32> {
         match event.kind {
             EventKind::Gone => return Ok(BridgeAction::Gone),
-            EventKind::Watch => {
-                self.handle_watch()?;
-            }
-            EventKind::Key(key)
-            | EventKind::NunchukKey(key)
-            | EventKind::ClassicControllerKey(key)
-            | EventKind::ProControllerKey(key)
-            | EventKind::GuitarKey(key)
-            | EventKind::DrumsKey(key) => {
-                self.handle_key(key)?;
-            }
-            EventKind::Accel(value) => {
-                self.handle_motion(MotionKind::Accel, &[value])?;
-                let result = self.aim.process_accelerometer([value.x, value.y, value.z]);
-                self.emit_aim(result)?;
-            }
-            EventKind::MotionPlus(value) => {
-                self.handle_motion(MotionKind::MotionPlus, &[value])?;
-                let result = self.aim.process_motion_plus([value.x, value.y, value.z]);
-                self.emit_aim(result)?;
-            }
-            EventKind::NunchukMove(values) => {
-                self.handle_motion(MotionKind::Nunchuk, &values)?;
-            }
-            EventKind::ClassicControllerMove(values) => {
-                self.handle_motion(MotionKind::Classic, &values)?;
-            }
-            EventKind::ProControllerMove(values) => {
-                self.handle_motion(MotionKind::Pro, &values)?;
-            }
-            EventKind::GuitarMove(values) => {
-                self.handle_motion(MotionKind::Guitar, &values)?;
-            }
-            EventKind::DrumsMove(values) => {
-                self.handle_motion(MotionKind::Drums, &values)?;
-            }
-            EventKind::BalanceBoard(values) => {
-                self.handle_motion(MotionKind::Balance, &values)?;
-            }
-            EventKind::Ir(values) => {
-                let mut frame = IrFrame::default();
-                for (point, value) in frame.points.iter_mut().zip(values) {
-                    *point = IrPoint {
-                        valid: valid_ir_point(&value),
-                        x: value.x,
-                        y: value.y,
-                    };
+            EventKind::Watch => self.handle_watch()?,
+            kind => {
+                if forwards_to_engine(kind, self.profile, &self.config)
+                    && let Some(input) = engine_input(kind)
+                {
+                    self.process(input)?;
                 }
-                let point = self.pointer.select_ir(&frame);
-                if has_desktop_profile(self.profile) {
-                    let delta = self.pointer.update_ir_frame(&frame);
-                    self.emit_pointer(delta.dx, delta.dy)?;
-                }
-                let result = self.aim.process_ir(point);
-                self.emit_aim(result)?;
             }
-            _ => {}
         }
         Ok(BridgeAction::Continue)
     }
-
-    fn handle_key(&mut self, key: ButtonEvent) -> Result<(), i32> {
-        let Some(state) = button_state(key.state) else {
-            return Ok(());
-        };
-        let Some(code) = button_code(key.button) else {
-            return Ok(());
-        };
-        if needs_gamepad(self.profile, &self.config)
-            && self.outputs_enabled
-            && let Some(mapped) = mapping::map_key(code)
-            && let Some(out) = self.gamepad.as_mut()
-        {
-            out.emit_key(mapped, state)?;
-        }
-        if has_desktop_profile(self.profile) {
-            self.desktop_key(code, state)?;
-            self.pointer_key(code, state)?;
-        }
-        let result = self.aim.activation_key(code, state != 0);
-        self.emit_aim(result)
-    }
-
-    fn handle_motion(&mut self, kind: MotionKind, values: &[Axis3]) -> Result<(), i32> {
-        if !needs_gamepad(self.profile, &self.config) || !self.outputs_enabled {
-            return Ok(());
-        }
-        let mut axes = [Abs3 { x: 0, y: 0, z: 0 }; 8];
-        for (target, source) in axes.iter_mut().zip(values) {
-            *target = Abs3 {
-                x: source.x,
-                y: source.y,
-                z: source.z,
-            };
-        }
-        let mapped = mapping::map_motion(kind, axes);
-        if let Some(out) = self.gamepad.as_mut() {
-            for axis in mapped.axes.iter().take(mapped.count) {
-                out.emit_abs(axis.code, axis.value)?;
-            }
-            out.syn()?;
-        }
-        Ok(())
-    }
-    fn desktop_key(&mut self, code: u32, state: u32) -> Result<(), i32> {
-        if !self.outputs_enabled {
-            return Ok(());
-        }
-        let action = match code {
-            4 => self.config.desktop_bindings.a,
-            5 => self.config.desktop_bindings.b,
-            6 => self.config.desktop_bindings.plus,
-            7 => self.config.desktop_bindings.minus,
-            8 => self.config.desktop_bindings.home,
-            9 => self.config.desktop_bindings.one,
-            10 => self.config.desktop_bindings.two,
-            _ => wiiland_core::DesktopAction::Disabled,
-        };
-        let code = match action {
-            wiiland_core::DesktopAction::LeftClick => 0x110,
-            wiiland_core::DesktopAction::RightClick => 0x111,
-            wiiland_core::DesktopAction::Enter => 28,
-            wiiland_core::DesktopAction::Escape => 1,
-            wiiland_core::DesktopAction::Overview => 125,
-            wiiland_core::DesktopAction::PageUp => 104,
-            wiiland_core::DesktopAction::PageDown => 109,
-            wiiland_core::DesktopAction::Disabled => return Ok(()),
-        };
-        if let Some(out) = self.desktop.as_mut() {
-            out.emit_key(code, state)
-        } else {
-            Ok(())
-        }
-    }
-    fn pointer_key(&mut self, code: u32, state: u32) -> Result<(), i32> {
-        let bit = match code {
-            0 => POINTER_LEFT,
-            1 => POINTER_RIGHT,
-            2 => POINTER_UP,
-            3 => POINTER_DOWN,
-            _ => return Ok(()),
-        };
-        let d = self.pointer.update_key(bit, state != 0);
-        self.emit_pointer(d.dx, d.dy)
-    }
-    fn emit_pointer(&mut self, dx: i32, dy: i32) -> Result<(), i32> {
-        if !self.outputs_enabled {
-            return Ok(());
-        }
-        if let Some(out) = self.desktop.as_mut() {
-            out.emit_rel(0, dx)?;
-            out.emit_rel(1, dy)?;
-            if dx != 0 || dy != 0 {
-                out.syn()?;
-            }
-        }
-        Ok(())
-    }
-    fn emit_aim(&mut self, r: wiiland_core::aim::AimResult) -> Result<(), i32> {
-        if !self.outputs_enabled {
-            return Ok(());
-        }
-        let Some(v) = r.output else { return Ok(()) };
-        match self.aim.config.output {
-            wiiland_core::AimMode::Mouse => {
-                if let Some(out) = self.desktop.as_mut() {
-                    out.emit_rel(0, v.x)?;
-                    out.emit_rel(1, v.y)?;
-                    if v.x != 0 || v.y != 0 {
-                        out.syn()?;
-                    }
-                }
-            }
-            wiiland_core::AimMode::RightStick => {
-                if let Some(out) = self.gamepad.as_mut() {
-                    out.emit_abs(mapping::ABS_RX, v.x.clamp(-32768, 32767))?;
-                    out.emit_abs(mapping::ABS_RY, v.y.clamp(-32768, 32767))?;
-                    out.syn()?;
-                }
-            }
-            wiiland_core::AimMode::Off => {}
-        }
-        Ok(())
+    pub fn pointer_active(&self) -> bool {
+        self.engine.pointer_active()
     }
     pub fn tick_pointer(&mut self) -> Result<(), i32> {
-        let d = self.pointer.tick();
-        self.emit_pointer(d.dx, d.dy)
+        self.process(EngineInput::PointerTick)
+    }
+    fn process(&mut self, input: EngineInput) -> Result<(), i32> {
+        self.actions.clear();
+        self.engine.process(input, &mut self.actions);
+        if !self.outputs_enabled {
+            return Ok(());
+        }
+        for action in &self.actions {
+            let target = match *action {
+                OutputAction::Key(target, ..)
+                | OutputAction::Abs(target, ..)
+                | OutputAction::Rel(target, ..)
+                | OutputAction::Sync(target) => target,
+            };
+            let device = match target {
+                OutputDevice::Gamepad => &mut self.gamepad,
+                OutputDevice::Desktop => &mut self.desktop,
+            };
+            if let Some(device) = device {
+                match *action {
+                    OutputAction::Key(_, code, value) => device.emit_key(code, value)?,
+                    OutputAction::Abs(_, code, value) => device.emit_abs(code, value)?,
+                    OutputAction::Rel(_, code, value) => device.emit_rel(code, value)?,
+                    OutputAction::Sync(_) => device.syn()?,
+                }
+            }
+        }
+        Ok(())
     }
 }
+
+fn forwards_to_engine(kind: EventKind, profile: Profile, config: &Config) -> bool {
+    kind.interface()
+        .is_some_and(|interface| requested_interfaces(profile, config).contains(interface))
+}
+
+fn engine_input(kind: EventKind) -> Option<EngineInput> {
+    if let Some((code, state)) = key_event(kind) {
+        return Some(EngineInput::Key { code, state });
+    }
+    if let EventKind::Ir(values) = kind {
+        return Some(EngineInput::Ir(IrFrame {
+            points: values.map(|value| IrPoint {
+                valid: valid_ir_point(&value),
+                x: value.x,
+                y: value.y,
+            }),
+        }));
+    }
+    let motion = match kind {
+        EventKind::Accel(_) => MotionKind::Accel,
+        EventKind::MotionPlus(_) => MotionKind::MotionPlus,
+        EventKind::NunchukMove(_) => MotionKind::Nunchuk,
+        EventKind::ClassicControllerMove(_) => MotionKind::Classic,
+        EventKind::ProControllerMove(_) => MotionKind::Pro,
+        EventKind::GuitarMove(_) => MotionKind::Guitar,
+        EventKind::DrumsMove(_) => MotionKind::Drums,
+        EventKind::BalanceBoard(_) => MotionKind::Balance,
+        _ => return None,
+    };
+    let mut axes = [Abs3 { x: 0, y: 0, z: 0 }; 8];
+    for (target, value) in axes.iter_mut().zip(axis_events(&kind)) {
+        *target = Abs3 {
+            x: value.x,
+            y: value.y,
+            z: value.z,
+        };
+    }
+    Some(EngineInput::Motion { kind: motion, axes })
+}
+
 impl<B: Backend + Clone> Drop for BridgeDevice<B> {
     fn drop(&mut self) {
         self.gamepad.take();
         self.desktop.take();
     }
-}
-fn needs_gamepad(p: Profile, c: &Config) -> bool {
-    p.contains(Profile::GAMEPAD) || c.aim_mode == wiiland_core::AimMode::RightStick
-}
-fn needs_desktop(p: Profile, c: &Config) -> bool {
-    p.contains(Profile::DESKTOP) || c.aim_mode == wiiland_core::AimMode::Mouse
-}
-fn has_desktop_profile(p: Profile) -> bool {
-    p.contains(Profile::DESKTOP)
 }
 fn profile_for_device(config: &Config, syspath: &Path, devtype: Option<&[u8]>) -> Profile {
     let syspath = syspath.to_string_lossy();
@@ -655,6 +501,28 @@ mod tests {
     use crate::uinput::{RecordingBackend, RecordingOp};
     use std::cell::RefCell;
     use wiiland_core::{AimActivation, AimMode, AimSource, DeviceRule, DeviceRuleKind};
+    use wiiland_hid::ButtonEvent;
+
+    #[test]
+    fn diagnostic_only_interfaces_never_change_virtual_input() {
+        let config = Config::default();
+        let key = EventKind::NunchukKey(ButtonEvent {
+            button: Button::C,
+            state: ButtonState::Pressed,
+        });
+        assert!(!forwards_to_engine(key, Profile::DESKTOP, &config));
+        assert!(forwards_to_engine(key, Profile::GAMEPAD, &config));
+        assert!(!forwards_to_engine(
+            EventKind::Accel(Axis3::default()),
+            Profile::DESKTOP,
+            &config
+        ));
+        assert!(!forwards_to_engine(
+            EventKind::Ir([Axis3::default(); 4]),
+            Profile::GAMEPAD,
+            &config
+        ));
+    }
 
     #[test]
     fn button_states_preserve_linux_input_values() {
@@ -773,7 +641,7 @@ mod tests {
             ..Config::default()
         };
         assert!(needs_desktop(config.profile, &config));
-        assert!(!has_desktop_profile(config.profile));
+        assert!(!config.profile.contains(Profile::DESKTOP));
     }
 
     #[test]
