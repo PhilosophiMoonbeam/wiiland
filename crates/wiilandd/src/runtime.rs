@@ -1,10 +1,14 @@
 //! Single-thread monitor/device reactor.
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod lifecycle_tests;
 use crate::bridge::{BridgeAction, BridgeDevice};
 use crate::diagnostics::DiagnosticWriter;
 use crate::ipc::IpcServer;
-use crate::signal::SignalPipe;
+use crate::platform::{DeviceSession, RuntimePlatform, SystemPlatform};
 use crate::uinput::{Backend, SystemBackend};
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
@@ -13,8 +17,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use wiiland_core::{Config, Profile, TraceConfig};
 use wiiland_hid::{
-    Axis3 as Abs, Button, ButtonEvent as HidButtonEvent, ButtonState, Event, EventKind, Monitor,
-    MonitorMode,
+    Axis3 as Abs, Button, ButtonEvent as HidButtonEvent, ButtonState, Event, EventKind,
 };
 use wiiland_ipc::{
     Axis3, ButtonEvent, DeviceInfo, InputPayload, Notification, RemovalReason, Status, Timestamp,
@@ -134,6 +137,10 @@ fn ipc_profile(profile: Profile) -> wiiland_ipc::Profile {
 pub const MAX_DEVICES: usize = 32;
 pub const POINTER_TICK: Duration = Duration::from_micros(16_000);
 pub const RECONCILE_TICK: Duration = Duration::from_secs(1);
+// Bound the number of setup attempts per iteration, not the duration of an
+// individual kernel operation. Slow device setup can still delay one tick.
+pub const DEVICE_SETUP_BUDGET: usize = 2;
+pub const MONITOR_EVENT_BUDGET: usize = 32;
 
 type DiagnosticSink = Box<dyn FnMut(&str)>;
 
@@ -232,11 +239,15 @@ fn missing_slots<'a>(
         .collect()
 }
 
-pub struct Runtime<B: Backend + Clone = SystemBackend> {
+pub struct Runtime<B: Backend + Clone = SystemBackend, P: RuntimePlatform<B> = SystemPlatform> {
     config: Config,
-    slots: [Option<BridgeDevice<B>>; MAX_DEVICES],
-    monitor: Option<Monitor>,
-    signal: SignalPipe,
+    slots: [Option<P::Device>; MAX_DEVICES],
+    platform: P,
+    snapshot_pending: bool,
+    monitor_pending: bool,
+    dispatch_started: Instant,
+    reconcile_again: bool,
+    pending_additions: VecDeque<PathBuf>,
     backend: B,
     dry_run: bool,
     diagnostics: Diagnostics,
@@ -252,19 +263,52 @@ pub struct Runtime<B: Backend + Clone = SystemBackend> {
     metrics: wiiland_ipc::Diagnostics,
 }
 
-fn device_info<B: Backend + Clone>(dev: &BridgeDevice<B>) -> DeviceInfo {
-    DeviceInfo {
-        syspath: dev.path().to_string_lossy().into_owned(),
-        profile: ipc_profile(dev.profile),
-        opened_interfaces: dev.opened_ifaces.bits(),
-        pending_interfaces: dev.pending_ifaces.bits(),
-        gamepad_output: dev.gamepad.is_some(),
-        desktop_output: dev.desktop.is_some(),
+fn device_info<D: DeviceSession>(dev: &D) -> DeviceInfo {
+    dev.info()
+}
+
+impl<B: Backend + Clone> DeviceSession for BridgeDevice<B> {
+    fn path(&self) -> &Path {
+        BridgeDevice::path(self)
+    }
+    fn fd(&self) -> std::os::fd::RawFd {
+        self.iface.as_fd().as_raw_fd()
+    }
+    fn drain(&mut self, observer: &mut dyn FnMut(&Event)) -> Result<BridgeAction, i32> {
+        self.drain_with(|_, event| observer(event))
+    }
+    fn set_capture(&mut self, enabled: bool) -> Result<(), i32> {
+        BridgeDevice::set_capture(self, enabled)
+    }
+    fn pointer_active(&self) -> bool {
+        BridgeDevice::pointer_active(self)
+    }
+    fn tick_pointer(&mut self) -> Result<(), i32> {
+        BridgeDevice::tick_pointer(self)
+    }
+    fn set_trace(
+        &mut self,
+        filter: wiiland_core::TraceFilter,
+        sequence: Rc<Cell<u64>>,
+        sink: Box<dyn FnMut(&str)>,
+    ) {
+        self.set_trace_sink_with_sequence(filter, sequence, sink);
+    }
+    fn info(&self) -> DeviceInfo {
+        let dev = self;
+        DeviceInfo {
+            syspath: dev.path().to_string_lossy().into_owned(),
+            profile: ipc_profile(dev.profile),
+            opened_interfaces: dev.opened_ifaces.bits(),
+            pending_interfaces: dev.pending_ifaces.bits(),
+            gamepad_output: dev.gamepad.is_some(),
+            desktop_output: dev.desktop.is_some(),
+        }
     }
 }
 
-fn status_snapshot<B: Backend + Clone>(
-    slots: &[Option<BridgeDevice<B>>],
+fn status_snapshot<D: DeviceSession>(
+    slots: &[Option<D>],
     dry_run: bool,
     socket_path: &Path,
 ) -> Status {
@@ -277,7 +321,7 @@ fn status_snapshot<B: Backend + Clone>(
     }
 }
 
-fn device_snapshot<B: Backend + Clone>(slots: &[Option<BridgeDevice<B>>]) -> Vec<DeviceInfo> {
+fn device_snapshot<D: DeviceSession>(slots: &[Option<D>]) -> Vec<DeviceInfo> {
     slots
         .iter()
         .filter_map(|slot| slot.as_ref().map(device_info))
@@ -292,12 +336,23 @@ impl Runtime<SystemBackend> {
 impl<B: Backend + Clone> Runtime<B> {
     pub fn with_backend(config: Config, backend: B) -> Result<Self, i32> {
         config.validate().map_err(|_| -libc::EINVAL)?;
+        Self::with_platform(config, backend, SystemPlatform::new()?)
+    }
+}
+impl<B: Backend + Clone, P: RuntimePlatform<B>> Runtime<B, P> {
+    pub fn with_platform(config: Config, backend: B, platform: P) -> Result<Self, i32> {
+        config.validate().map_err(|_| -libc::EINVAL)?;
+        let dispatch_started = platform.now();
         let diagnostic_writer = DiagnosticWriter::stderr();
         Ok(Self {
             config,
             slots: std::array::from_fn(|_| None),
-            monitor: None,
-            signal: SignalPipe::install()?,
+            platform,
+            snapshot_pending: false,
+            monitor_pending: false,
+            dispatch_started,
+            reconcile_again: false,
+            pending_additions: VecDeque::new(),
             backend,
             dry_run: false,
             diagnostics: Diagnostics::queued(&diagnostic_writer),
@@ -361,7 +416,7 @@ impl<B: Backend + Clone> Runtime<B> {
             });
             return Err(code);
         };
-        match BridgeDevice::with_backend_outputs(
+        match self.platform.open_device(
             path,
             &self.config,
             self.backend.clone(),
@@ -370,10 +425,10 @@ impl<B: Backend + Clone> Runtime<B> {
             Ok(mut dev) => {
                 if self.trace.enabled {
                     let sender = self.trace_writer.sender();
-                    dev.set_trace_sink_with_sequence(
+                    dev.set_trace(
                         self.trace.filter,
                         Rc::clone(&self.trace_sequence),
-                        move |line| sender.send(line),
+                        Box::new(move |line| sender.send(line)),
                     );
                 }
                 self.slots[slot] = Some(dev);
@@ -400,84 +455,74 @@ impl<B: Backend + Clone> Runtime<B> {
             .iter()
             .position(|x| x.as_ref().is_some_and(|d| d.path() == path))
     }
-    fn reconcile(&mut self) {
-        let mut snapshot = match Monitor::new(MonitorMode::Enumerate) {
-            Ok(monitor) => monitor,
-            Err(error) => {
-                self.diagnostics.emit(Lifecycle::Error {
+    fn request_reconcile(&mut self) {
+        if self.snapshot_pending || !self.pending_additions.is_empty() {
+            self.reconcile_again = true;
+            return;
+        }
+        match self.platform.request_snapshot() {
+            Ok(()) => self.snapshot_pending = true,
+            Err(error) => self.diagnostics.emit(Lifecycle::Error {
+                operation: "reconcile request",
+                path: None,
+                code: io_errno(&error),
+            }),
+        }
+    }
+
+    /// Apply completed discovery work between readiness batches. Stable slots
+    /// cannot be replaced while old poll owners are still being dispatched.
+    fn service_discovery(&mut self) {
+        if self.snapshot_pending
+            && let Some(snapshot) = self.platform.take_snapshot()
+        {
+            self.snapshot_pending = false;
+            match snapshot {
+                Ok(paths) => {
+                    let remove = missing_slots(
+                        self.slots
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, dev)| dev.as_ref().map(|dev| (slot, dev.path()))),
+                        &paths,
+                    );
+                    for slot in remove {
+                        if let Some(dev) = self.slots[slot].take() {
+                            let path = dev.path().to_path_buf();
+                            self.publish_removed(&path, RemovalReason::Removed);
+                            self.diagnostics.emit(Lifecycle::Remove(&path));
+                        }
+                    }
+                    let mut additions = Vec::new();
+                    for path in &paths {
+                        if self.find(path).is_none() {
+                            push_unique(&mut additions, path.clone());
+                        }
+                    }
+                    self.pending_additions.extend(additions);
+                    self.diagnostics.emit(Lifecycle::Reconcile {
+                        snapshot: paths.len(),
+                        queued: self.pending_additions.len(),
+                        active: self.slots.iter().flatten().count(),
+                    });
+                }
+                Err(error) => self.diagnostics.emit(Lifecycle::Error {
                     operation: "reconcile snapshot",
                     path: None,
                     code: io_errno(&error),
-                });
-                return;
-            }
-        };
-        let mut paths = Vec::<PathBuf>::new();
-        loop {
-            match snapshot.poll() {
-                Ok(Some(path)) => {
-                    push_unique(&mut paths, path);
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    self.diagnostics.emit(Lifecycle::Error {
-                        operation: "reconcile snapshot",
-                        path: None,
-                        code: io_errno(&error),
-                    });
-                    return;
-                }
+                }),
             }
         }
-        let snapshot_count = paths.len();
-        let remove = missing_slots(
-            self.slots
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, dev)| dev.as_ref().map(|dev| (slot, dev.path()))),
-            &paths,
-        );
-        for slot in remove {
-            if let Some(dev) = self.slots[slot].take() {
-                let path = dev.path().to_path_buf();
-                self.publish_removed(&path, RemovalReason::Removed);
-                self.diagnostics.emit(Lifecycle::Remove(&path));
-            }
-        }
-        for path in paths {
+        for _ in 0..DEVICE_SETUP_BUDGET {
+            let Some(path) = self.pending_additions.pop_front() else {
+                break;
+            };
             let _ = self.add_path(path);
         }
-
-        let mut queued = Vec::new();
-        let mut queued_count = 0;
-        if let Some(mon) = self.monitor.as_mut() {
-            loop {
-                match mon.poll() {
-                    Ok(Some(path)) => {
-                        queued_count += 1;
-                        push_unique(&mut queued, path);
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        self.diagnostics.emit(Lifecycle::Error {
-                            operation: "monitor",
-                            path: None,
-                            code: io_errno(&error),
-                        });
-                        break;
-                    }
-                }
-            }
+        if !self.snapshot_pending && self.pending_additions.is_empty() && self.reconcile_again {
+            self.reconcile_again = false;
+            self.request_reconcile();
         }
-        for path in queued {
-            let _ = self.add_path(path);
-        }
-        let active = self.slots.iter().filter(|slot| slot.is_some()).count();
-        self.diagnostics.emit(Lifecycle::Reconcile {
-            snapshot: snapshot_count,
-            queued: queued_count,
-            active,
-        });
     }
     fn drain_device(&mut self, slot: usize, single: bool) -> Result<(), i32> {
         let Some(path) = self.slots[slot]
@@ -492,7 +537,7 @@ impl<B: Backend + Clone> Runtime<B> {
                 let syspath = path.to_string_lossy().into_owned();
                 let mut inputs = Vec::new();
                 let outcome = self.slots[slot].as_mut().map(|dev| {
-                    dev.drain_with(|_, event| {
+                    dev.drain(&mut |event| {
                         inputs.push(Notification::Input {
                             sequence: next_sequence(&sequence),
                             syspath: syspath.clone(),
@@ -506,7 +551,7 @@ impl<B: Backend + Clone> Runtime<B> {
                 }
                 outcome
             } else {
-                self.slots[slot].as_mut().map(BridgeDevice::drain)
+                self.slots[slot].as_mut().map(|dev| dev.drain(&mut |_| {}))
             };
         match outcome {
             Some(Ok(BridgeAction::Continue)) | None => {}
@@ -537,16 +582,14 @@ impl<B: Backend + Clone> Runtime<B> {
         self.poll_owners.clear();
         self.ipc_sources.clear();
         self.poll_fds.push(libc::pollfd {
-            fd: self.signal.read_fd(),
+            fd: self.platform.signal_fd(),
             events: libc::POLLIN,
             revents: 0,
         });
         self.poll_owners.push(PollOwner::Signal);
-        if let Some(mon) = self.monitor.as_mut()
-            && let Some(fd) = mon.fd()
-        {
+        if let Some(fd) = self.platform.monitor_fd() {
             self.poll_fds.push(libc::pollfd {
-                fd: fd.as_raw_fd(),
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -555,7 +598,7 @@ impl<B: Backend + Clone> Runtime<B> {
         for (slot, dev) in self.slots.iter().enumerate() {
             if let Some(dev) = dev {
                 self.poll_fds.push(libc::pollfd {
-                    fd: dev.iface.as_fd().as_raw_fd(),
+                    fd: dev.fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 });
@@ -574,35 +617,33 @@ impl<B: Backend + Clone> Runtime<B> {
             self.poll_owners.push(PollOwner::Ipc(source.token));
         }
 
-        let result = unsafe {
-            libc::poll(
-                self.poll_fds.as_mut_ptr(),
-                self.poll_fds.len() as libc::nfds_t,
-                timeout_ms,
-            )
-        };
-        if result < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                return Ok(false);
-            }
-            let code = io_errno(&e);
-            self.diagnostics.emit(Lifecycle::Error {
-                operation: "poll",
-                path: None,
-                code,
-            });
-            return Err(code);
-        }
-        if self.signal.requested() || self.poll_fds[0].revents != 0 {
-            let _ = self.signal.drain();
+        let polled = self.platform.poll(&mut self.poll_fds, timeout_ms);
+        self.dispatch_started = self.platform.now();
+        if self.platform.shutdown_requested() {
+            self.platform.drain_signal();
             return Ok(true);
         }
-        if result == 0 {
+        let result = match polled {
+            Ok(result) => result,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(false),
+            Err(error) => {
+                let code = io_errno(&error);
+                self.diagnostics.emit(Lifecycle::Error {
+                    operation: "poll",
+                    path: None,
+                    code,
+                });
+                return Err(code);
+            }
+        };
+        if self.poll_fds[0].revents != 0 {
+            self.platform.drain_signal();
+            return Ok(true);
+        }
+        if result == 0 && !self.monitor_pending {
             return Ok(false);
         }
 
-        let dispatch_started = Instant::now();
         // Slots never move, so all device owners remain valid until this phase
         // is complete. Reconciliation is deliberately deferred below.
         for index in 0..self.poll_owners.len() {
@@ -617,8 +658,19 @@ impl<B: Backend + Clone> Runtime<B> {
         let monitor_ready = self.poll_owners.iter().enumerate().any(|(index, owner)| {
             *owner == PollOwner::Monitor && self.poll_fds[index].revents != 0
         });
-        if monitor_ready {
-            self.reconcile();
+        if monitor_ready || self.monitor_pending {
+            match self.platform.drain_monitor(MONITOR_EVENT_BUDGET) {
+                Ok(pending) => self.monitor_pending = pending,
+                Err(error) => {
+                    self.monitor_pending = false;
+                    self.diagnostics.emit(Lifecycle::Error {
+                        operation: "monitor",
+                        path: None,
+                        code: io_errno(&error),
+                    });
+                }
+            }
+            self.request_reconcile();
         }
 
         if has_ready_ipc(&self.poll_owners, &self.poll_fds) {
@@ -653,10 +705,6 @@ impl<B: Backend + Clone> Runtime<B> {
             }
         }
         self.service_commands();
-        self.metrics.max_dispatch_duration_us = self
-            .metrics
-            .max_dispatch_duration_us
-            .max(dispatch_started.elapsed().as_micros().min(u64::MAX as u128) as u64);
         Ok(false)
     }
     fn control_command(
@@ -724,23 +772,30 @@ impl<B: Backend + Clone> Runtime<B> {
     }
 
     fn loop_run(&mut self, single: bool) -> Result<(), i32> {
-        let mut next_pointer = Instant::now() + POINTER_TICK;
-        let mut next_reconcile = Instant::now() + RECONCILE_TICK;
+        let mut next_pointer = self.platform.now() + POINTER_TICK;
+        let mut next_reconcile = self.platform.now() + RECONCILE_TICK;
         loop {
-            if self.signal.requested() {
+            if self.platform.shutdown_requested() {
                 return Ok(());
             }
-            let now = Instant::now();
+            let now = self.platform.now();
             let mut deadline = next_pointer.min(next_reconcile);
             if single {
                 deadline = next_pointer;
             }
             let timeout = deadline.saturating_duration_since(now);
-            let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            // Round up to avoid a sub-millisecond busy loop near a deadline.
+            let ms = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+            let ms = if self.pending_additions.is_empty() && !self.monitor_pending {
+                ms
+            } else {
+                0
+            };
             if self.poll_once(ms, single)? {
                 return Ok(());
             }
-            let now = Instant::now();
+            let dispatch_started = self.dispatch_started;
+            let now = self.platform.now();
             if now >= next_pointer {
                 self.metrics.max_pointer_lateness_us = self.metrics.max_pointer_lateness_us.max(
                     now.duration_since(next_pointer)
@@ -774,18 +829,30 @@ impl<B: Backend + Clone> Runtime<B> {
                 }
             }
             if !single && now >= next_reconcile {
-                self.reconcile();
+                self.request_reconcile();
                 while next_reconcile <= now {
                     next_reconcile += RECONCILE_TICK;
                 }
             }
+            if !single {
+                self.service_discovery();
+            }
+            // Discovery can change capture ownership after reconnecting a path.
+            self.service_commands();
+            self.metrics.max_dispatch_duration_us = self.metrics.max_dispatch_duration_us.max(
+                self.platform
+                    .now()
+                    .duration_since(dispatch_started)
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64,
+            );
             if single && self.slots.iter().all(Option::is_none) {
                 return Ok(());
             }
         }
     }
     pub fn run_monitor(&mut self) -> Result<(), i32> {
-        let mon = Monitor::new(MonitorMode::Watch).map_err(|error| {
+        self.platform.start_monitor().map_err(|error| {
             let code = io_errno(&error);
             self.diagnostics.emit(Lifecycle::Error {
                 operation: "monitor",
@@ -794,8 +861,7 @@ impl<B: Backend + Clone> Runtime<B> {
             });
             code
         })?;
-        self.monitor = Some(mon);
-        self.reconcile();
+        self.request_reconcile();
         self.loop_run(false)
     }
     pub fn run_single(&mut self, path: impl AsRef<Path>) -> Result<(), i32> {
@@ -803,13 +869,12 @@ impl<B: Backend + Clone> Runtime<B> {
         self.loop_run(true)
     }
 }
-impl<B: Backend + Clone> Drop for Runtime<B> {
+impl<B: Backend + Clone, P: RuntimePlatform<B>> Drop for Runtime<B, P> {
     fn drop(&mut self) {
         self.ipc.take();
         for slot in &mut self.slots {
             slot.take();
         }
-        self.monitor.take();
         self.diagnostics.sink = Box::new(|_| {});
     }
 }

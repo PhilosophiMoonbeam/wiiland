@@ -62,9 +62,10 @@ impl CalibrationStats {
         if self.samples == 0 {
             return 0;
         }
-        (self.max_x - self.min_x)
-            .max(self.max_y - self.min_y)
-            .max(self.max_z - self.min_z)
+        (i64::from(self.max_x) - i64::from(self.min_x))
+            .max(i64::from(self.max_y) - i64::from(self.min_y))
+            .max(i64::from(self.max_z) - i64::from(self.min_z))
+            .min(i64::from(i32::MAX)) as i32
     }
     pub fn finish(&self) -> Option<SensorCalibration> {
         if self.samples < AIM_CALIBRATION_MIN_SAMPLES || self.jitter() > AIM_CALIBRATION_MAX_JITTER

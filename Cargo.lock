@@ -3436,6 +3436,7 @@ version = "2.0.0"
 dependencies = [
  "eframe",
  "egui",
+ "libc",
  "tempfile",
  "wiiland-core",
  "wiiland-ipc",
@@ -3457,6 +3458,7 @@ name = "wiiland-hid"
 version = "2.0.0"
 dependencies = [
  "libc",
+ "wiiland-core",
 ]
 
 [[package]]

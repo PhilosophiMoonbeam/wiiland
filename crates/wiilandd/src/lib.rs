@@ -9,6 +9,7 @@ pub mod cli;
 pub mod commands;
 mod diagnostics;
 mod ipc;
+pub mod platform;
 pub mod report;
 pub mod runtime;
 pub mod signal;

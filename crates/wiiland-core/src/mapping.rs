@@ -3,6 +3,8 @@
 //! Event values are processed with signed 64-bit intermediates to preserve the
 //! original truncation and asymmetric extrema rules without floating point.
 
+use crate::input::Button;
+
 pub const VIRTUAL_AXIS_MIN: i32 = -32_768;
 pub const VIRTUAL_AXIS_MAX: i32 = 32_767;
 pub const VIRTUAL_TRIGGER_MAX: i32 = 1_023;
@@ -181,39 +183,42 @@ pub fn scale_unsigned_axis(value: i32, source_max: i32, target_max: i32) -> i32 
     (i64::from(value) * i64::from(target_max) / i64::from(source_max)) as i32
 }
 
-/// Internal Wii button identifiers, contiguous for table indexing.
+/// Compatibility adapter for stable logical button numbers.
 pub fn map_key(code: u32) -> Option<u16> {
-    Some(match code {
-        0 => BTN_DPAD_LEFT,
-        1 => BTN_DPAD_RIGHT,
-        2 => BTN_DPAD_UP,
-        3 => BTN_DPAD_DOWN,
-        4 => BTN_SOUTH,
-        5 => BTN_EAST,
-        6 => BTN_START,
-        7 => BTN_SELECT,
-        8 => BTN_MODE,
-        9 => BTN_1,
-        10 => BTN_2,
-        11 => BTN_NORTH,
-        12 => BTN_WEST,
-        13 => BTN_TL,
-        14 => BTN_TR,
-        15 => BTN_TL2,
-        16 => BTN_TR2,
-        17 => BTN_THUMBL,
-        18 => BTN_THUMBR,
-        19 => BTN_C,
-        20 => BTN_Z,
-        21 => BTN_STRUM_BAR_UP,
-        22 => BTN_STRUM_BAR_DOWN,
-        23 => BTN_FRET_FAR_UP,
-        24 => BTN_FRET_UP,
-        25 => BTN_FRET_MID,
-        26 => BTN_FRET_LOW,
-        27 => BTN_FRET_FAR_LOW,
-        _ => return None,
-    })
+    Button::from_code(code).map(map_button)
+}
+
+pub fn map_button(button: Button) -> u16 {
+    match button {
+        Button::Left => BTN_DPAD_LEFT,
+        Button::Right => BTN_DPAD_RIGHT,
+        Button::Up => BTN_DPAD_UP,
+        Button::Down => BTN_DPAD_DOWN,
+        Button::A => BTN_SOUTH,
+        Button::B => BTN_EAST,
+        Button::Plus => BTN_START,
+        Button::Minus => BTN_SELECT,
+        Button::Home => BTN_MODE,
+        Button::One => BTN_1,
+        Button::Two => BTN_2,
+        Button::X => BTN_NORTH,
+        Button::Y => BTN_WEST,
+        Button::ShoulderLeft => BTN_TL,
+        Button::ShoulderRight => BTN_TR,
+        Button::TriggerLeft => BTN_TL2,
+        Button::TriggerRight => BTN_TR2,
+        Button::ThumbLeft => BTN_THUMBL,
+        Button::ThumbRight => BTN_THUMBR,
+        Button::C => BTN_C,
+        Button::Z => BTN_Z,
+        Button::StrumBarUp => BTN_STRUM_BAR_UP,
+        Button::StrumBarDown => BTN_STRUM_BAR_DOWN,
+        Button::FretFarUp => BTN_FRET_FAR_UP,
+        Button::FretUp => BTN_FRET_UP,
+        Button::FretMid => BTN_FRET_MID,
+        Button::FretLow => BTN_FRET_LOW,
+        Button::FretFarLow => BTN_FRET_FAR_LOW,
+    }
 }
 pub fn accel_abs_code(index: usize) -> Option<u16> {
     [ABS_THROTTLE, ABS_RUDDER, ABS_WHEEL].get(index).copied()

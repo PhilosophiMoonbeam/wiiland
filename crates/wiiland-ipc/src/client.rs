@@ -3,7 +3,7 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     Command, DeviceInfo, FrameBuffer, FrameError, Notification, PROTOCOL_MAJOR, ProtocolError,
@@ -247,13 +247,29 @@ impl Client {
 
     /// Return the next queued notification, blocking until one is available.
     pub fn next_event(&mut self) -> Result<Notification, ClientError> {
+        loop {
+            if let Some(notification) = self.poll_event()? {
+                return Ok(notification);
+            }
+        }
+    }
+
+    /// Return a queued notification or read at most one socket chunk.
+    ///
+    /// `None` means a partial frame was retained for the next call. Each socket
+    /// read observes the configured timeout; callers can check cancellation and
+    /// absolute deadlines between calls even when a peer trickles frame bytes.
+    pub fn poll_event(&mut self) -> Result<Option<Notification>, ClientError> {
         self.ensure_active()?;
         if let Some((notification, frame_bytes)) = self.notifications.pop_front() {
             self.notification_bytes -= frame_bytes;
-            return Ok(notification);
+            return Ok(Some(notification));
         }
-        match self.read_message()?.0 {
-            ServerMessage::Notification(notification) => Ok(notification),
+        let Some((message, _)) = self.poll_message()? else {
+            return Ok(None);
+        };
+        match message {
+            ServerMessage::Notification(notification) => Ok(Some(notification)),
             ServerMessage::Response { .. } => Err(ClientError::UnexpectedMessage),
             ServerMessage::Error { error, .. } => Err(ClientError::Server { error }),
         }
@@ -299,8 +315,41 @@ impl Client {
         let request = Request { id, command };
         let frame = encode_frame(&request)?;
         self.stream.write_all(&frame).map_err(map_stream_io_error)?;
+        let timeout = self.stream.read_timeout()?;
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let result = self.read_response(id, deadline);
+        // A deadline only narrows this request's reads. Restore the caller's
+        // timeout on success and failure before returning control.
+        let restored = self.stream.set_read_timeout(timeout);
+        match result {
+            Ok(response) => {
+                restored?;
+                Ok(response)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_response(
+        &mut self,
+        id: u64,
+        deadline: Option<Instant>,
+    ) -> Result<ResponseResult, ClientError> {
         loop {
-            let (message, frame_bytes) = self.read_message()?;
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "IPC response deadline exceeded",
+                    )
+                    .into());
+                }
+                self.stream.set_read_timeout(Some(remaining))?;
+            }
+            let Some((message, frame_bytes)) = self.poll_message()? else {
+                continue;
+            };
             match message {
                 ServerMessage::Notification(notification) => {
                     self.queue_notification(notification, frame_bytes)?;
@@ -374,38 +423,34 @@ impl Client {
         id
     }
 
-    fn read_message(&mut self) -> Result<(ServerMessage, usize), ClientError> {
+    fn poll_message(&mut self) -> Result<Option<(ServerMessage, usize)>, ClientError> {
         if let Some(message) = self.messages.pop_front() {
-            return Ok(message);
+            return Ok(Some(message));
         }
         let mut bytes = [0u8; 8192];
-        loop {
-            let count = self.stream.read(&mut bytes).map_err(map_stream_io_error)?;
-            if count == 0 {
-                return Err(ClientError::PrematureEof);
-            }
-            let buffered_bytes = self.frames.len();
-            let frames = self
-                .frames
-                .push(&bytes[..count])
-                .map_err(ClientError::Frame)?;
-            let mut received_chunks = bytes[..count].split_inclusive(|&byte| byte == b'\n');
-            let mut prefix_bytes = buffered_bytes;
-            for frame in frames {
-                let received_chunk = received_chunks
-                    .next()
-                    .expect("each completed frame has a received delimiter");
-                let frame_bytes = prefix_bytes + received_chunk.len();
-                prefix_bytes = 0;
-                self.messages.push_back((
-                    decode_frame(&frame).map_err(ClientError::Frame)?,
-                    frame_bytes,
-                ));
-            }
-            if let Some(message) = self.messages.pop_front() {
-                return Ok(message);
-            }
+        let count = self.stream.read(&mut bytes).map_err(map_stream_io_error)?;
+        if count == 0 {
+            return Err(ClientError::PrematureEof);
         }
+        let buffered_bytes = self.frames.len();
+        let frames = self
+            .frames
+            .push(&bytes[..count])
+            .map_err(ClientError::Frame)?;
+        let mut received_chunks = bytes[..count].split_inclusive(|&byte| byte == b'\n');
+        let mut prefix_bytes = buffered_bytes;
+        for frame in frames {
+            let received_chunk = received_chunks
+                .next()
+                .expect("each completed frame has a received delimiter");
+            let frame_bytes = prefix_bytes + received_chunk.len();
+            prefix_bytes = 0;
+            self.messages.push_back((
+                decode_frame(&frame).map_err(ClientError::Frame)?,
+                frame_bytes,
+            ));
+        }
+        Ok(self.messages.pop_front())
     }
 }
 
@@ -426,4 +471,56 @@ pub fn default_socket_path() -> Result<PathBuf, ClientError> {
         return Err(ClientError::RuntimeDirectoryRelative(runtime));
     }
     Ok(runtime.join("wiiland").join("wiilandd.sock"))
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn request_restores_the_configured_read_timeout_on_success_and_failure() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let timeout = Some(Duration::from_millis(100));
+        stream.set_read_timeout(timeout).unwrap();
+        let mut client = Client {
+            stream,
+            socket_path: PathBuf::new(),
+            frames: FrameBuffer::new(),
+            notifications: VecDeque::new(),
+            notification_bytes: 0,
+            messages: VecDeque::new(),
+            terminated: false,
+            next_id: 1,
+            protocol_minor: 1,
+        };
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(peer.try_clone().unwrap());
+            let mut frame = Vec::new();
+            reader.read_until(b'\n', &mut frame).unwrap();
+            let request: Request = decode_frame(&frame).unwrap();
+            let response = encode_frame(&ServerMessage::Response {
+                id: request.id,
+                result: ResponseResult::Pong,
+            })
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            peer.write_all(&response[..5]).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            peer.write_all(&response[5..]).unwrap();
+            frame.clear();
+            reader.read_until(b'\n', &mut frame).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            peer.write_all(b"{").unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        client.ping().unwrap();
+        assert_eq!(client.stream.read_timeout().unwrap(), timeout);
+        assert!(
+            matches!(client.ping(), Err(ClientError::Io(error)) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
+        assert_eq!(client.stream.read_timeout().unwrap(), timeout);
+        drop(client);
+        server.join().unwrap();
+    }
 }

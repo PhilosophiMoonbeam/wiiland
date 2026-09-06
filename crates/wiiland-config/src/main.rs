@@ -1,3 +1,4 @@
+mod config_task;
 mod live;
 mod model;
 mod process;
@@ -8,7 +9,10 @@ use std::io::Write;
 
 use eframe::egui;
 
-use model::{ApplyCompletion, Completion, ConfigModel, OUTPUT_BLOCK_LIMIT, TransactionKind};
+use model::{
+    ApplyCompletion, Completion, ConfigFailure, ConfigFailureStage, ConfigModel, ConfigValue,
+    OUTPUT_BLOCK_LIMIT, TransactionKind,
+};
 use ui::ControlCenter;
 
 const APPLICATION_ID: &str = "io.github.philosophimoonbeam.wiiland-config";
@@ -58,17 +62,12 @@ fn write_smoke_report() -> std::io::Result<()> {
         .begin(TransactionKind::Load, Vec::new())
         .expect("smoke load transaction");
     model.mark_dirty();
-    let stale_load = Completion {
-        id: load.id,
-        kind: TransactionKind::Load,
-        revision: load.revision,
-        target: load.target.clone(),
-        success: true,
-        code: Some(0),
-        stdout: b"profile=gamepad\npointer-speed=99\n".to_vec(),
-        stderr: Vec::new(),
-        captured: Vec::new(),
-    };
+    let stale_load = Completion::new(
+        &load,
+        Ok(ConfigValue::Loaded(
+            model::parse_config_bytes(b"profile=gamepad\npointer-speed=99\n").unwrap(),
+        )),
+    );
     let load_transaction_safe =
         model.finish(&stale_load) == ApplyCompletion::Stale && model.transaction.is_none();
 
@@ -80,16 +79,17 @@ fn write_smoke_report() -> std::io::Result<()> {
         .expect("smoke save transaction");
     model.config.pointer_speed = 18;
     model.mark_dirty();
-    let save_completion = Completion {
-        id: save.id,
-        kind: TransactionKind::Save,
-        revision: save.revision,
-        target: save.target.clone(),
-        success: true,
-        code: Some(0),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        captured: saved_snapshot.clone(),
+    let save_task = config_task::ConfigTask::spawn(save, "/bin/true".to_owned(), None);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let save_completion = loop {
+        match save_task.try_recv() {
+            Ok(config_task::ConfigEvent::Finished(completion)) => break completion,
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(std::io::Error::other(format!("smoke save worker: {error}"))),
+        }
     };
     let save_transaction_safe = model.finish(&save_completion) == ApplyCompletion::Stale
         && std::fs::read(&explicit_path)
@@ -99,17 +99,13 @@ fn write_smoke_report() -> std::io::Result<()> {
     let error = model
         .begin(TransactionKind::Load, Vec::new())
         .expect("smoke error transaction");
-    let error_completion = Completion {
-        id: error.id,
-        kind: TransactionKind::Load,
-        revision: error.revision,
-        target: error.target,
-        success: false,
-        code: Some(9),
-        stdout: Vec::new(),
-        stderr: b"delayed fake load failure\n".to_vec(),
-        captured: Vec::new(),
-    };
+    let error_completion = Completion::new(
+        &error,
+        Err(ConfigFailure {
+            stage: ConfigFailureStage::Load,
+            message: "delayed fake load failure".to_owned(),
+        }),
+    );
     let error_recovered =
         model.finish(&error_completion) == ApplyCompletion::Failed && model.transaction.is_none();
 

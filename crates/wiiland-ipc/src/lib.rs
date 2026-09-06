@@ -12,10 +12,12 @@
 //! libc, C ABI, executable, or daemon implementation details. [`Client`] is
 //! the blocking Unix-socket facade.
 
+mod capture;
 mod client;
 mod protocol;
 mod session;
 
+pub use capture::CaptureConnection;
 pub use client::{Client, ClientError, default_socket_path};
 pub use protocol::{
     Axis3, ButtonEvent, Command, DeviceInfo, Diagnostics, FrameBuffer, FrameError, InputPayload,

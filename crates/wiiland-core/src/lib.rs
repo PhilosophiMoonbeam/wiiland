@@ -5,6 +5,7 @@ pub mod calibration;
 pub mod config;
 pub mod config_io;
 pub mod engine;
+pub mod input;
 pub mod mapping;
 pub mod pointer;
 pub mod trace;

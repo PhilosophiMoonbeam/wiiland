@@ -13,6 +13,29 @@ pub enum MonitorMode {
     Watch,
 }
 
+/// Result of a bounded discovery pass.
+#[derive(Debug, Eq, PartialEq)]
+pub enum MonitorPoll {
+    Path(PathBuf),
+    /// The work budget was exhausted; call again even if the fd is not ready.
+    Pending,
+    /// Initial enumeration and the currently queued monitor events are drained.
+    Empty,
+}
+
+fn poll_budget(
+    budget: usize,
+    mut step: impl FnMut() -> io::Result<MonitorPoll>,
+) -> io::Result<MonitorPoll> {
+    for _ in 0..budget {
+        match step()? {
+            MonitorPoll::Pending => {}
+            result => return Ok(result),
+        }
+    }
+    Ok(MonitorPoll::Pending)
+}
+
 struct Initial {
     path: Vec<u8>,
     next: Option<Box<Initial>>,
@@ -136,7 +159,7 @@ impl Monitor {
         }
     }
     fn next_enum(&mut self) -> io::Result<Option<UdevDevice>> {
-        while !self.entry.is_null() {
+        if !self.entry.is_null() {
             let e = self.entry;
             self.entry = unsafe { sys::udev_list_entry_get_next(e) };
             let Some(path) = (unsafe { sys::cstr(sys::udev_list_entry_get_name(e)) }) else {
@@ -151,6 +174,7 @@ impl Monitor {
                 return Ok(Some(UdevDevice(device)));
             }
             classify_enum_device_errno(errno)?;
+            return Ok(None);
         }
         self.enumerated = true;
         if self.monitor.is_none() {
@@ -182,39 +206,50 @@ impl Monitor {
         Some(PathBuf::from(d.syspath()?.to_string_lossy().into_owned()))
     }
 
+    /// Read at most `budget` enumeration entries or queued udev events.
+    pub fn poll_bounded(&mut self, budget: usize) -> io::Result<MonitorPoll> {
+        poll_budget(budget, || self.poll_step())
+    }
+
     pub fn poll(&mut self) -> io::Result<Option<PathBuf>> {
-        if !self.enumerated {
-            loop {
-                let Some(d) = self.next_enum()? else {
-                    return Ok(None);
-                };
-                if let Some(p) = self.valid_device(&d) {
-                    return Ok(Some(p));
-                }
+        loop {
+            match self.poll_bounded(64)? {
+                MonitorPoll::Path(path) => return Ok(Some(path)),
+                MonitorPoll::Pending => {}
+                MonitorPoll::Empty => return Ok(None),
             }
+        }
+    }
+
+    fn poll_step(&mut self) -> io::Result<MonitorPoll> {
+        if !self.enumerated {
+            if let Some(device) = self.next_enum()?
+                && let Some(path) = self.valid_device(&device)
+            {
+                return Ok(MonitorPoll::Path(path));
+            }
+            return Ok(MonitorPoll::Pending);
         }
         let Some(mp) = self.monitor.as_ref().map(|m| m.0) else {
-            return Ok(None);
+            return Ok(MonitorPoll::Empty);
         };
-        loop {
-            let (p, errno) = unsafe {
-                *libc::__errno_location() = 0;
-                let p = sys::udev_monitor_receive_device(mp);
-                (p, sys::errno())
-            };
-            if p.is_null() {
-                let empty = null_receive(errno)?;
-                self.free_enum();
-                return Ok(empty);
-            }
-            let d = UdevDevice(p);
-            if self.deduplicate(&d) {
-                continue;
-            }
-            if let Some(path) = self.valid_device(&d) {
-                return Ok(Some(path));
-            }
+        let (p, errno) = unsafe {
+            *libc::__errno_location() = 0;
+            let p = sys::udev_monitor_receive_device(mp);
+            (p, sys::errno())
+        };
+        if p.is_null() {
+            null_receive::<()>(errno)?;
+            self.free_enum();
+            return Ok(MonitorPoll::Empty);
         }
+        let device = UdevDevice(p);
+        if !self.deduplicate(&device)
+            && let Some(path) = self.valid_device(&device)
+        {
+            return Ok(MonitorPoll::Path(path));
+        }
+        Ok(MonitorPoll::Pending)
     }
 }
 
@@ -227,7 +262,10 @@ impl Drop for Monitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{Initial, classify_enum_device_errno, deduplicate_initial, null_receive};
+    use super::{
+        Initial, MonitorPoll, classify_enum_device_errno, deduplicate_initial, null_receive,
+        poll_budget,
+    };
 
     fn initial(paths: &[&[u8]]) -> Option<Box<Initial>> {
         paths.iter().rev().fold(None, |next, path| {
@@ -237,6 +275,45 @@ mod tests {
             }))
         })
     }
+    #[test]
+    fn irrelevant_events_cannot_exceed_poll_budget() {
+        let mut reads = 0;
+        let result = poll_budget(3, || {
+            reads += 1;
+            Ok(MonitorPoll::Pending)
+        })
+        .unwrap();
+        assert_eq!(result, MonitorPoll::Pending);
+        assert_eq!(reads, 3);
+        assert_eq!(
+            poll_budget(0, || panic!("zero budget must not read")).unwrap(),
+            MonitorPoll::Pending
+        );
+    }
+
+    #[test]
+    fn bounded_poll_stops_at_a_device_or_drained_queue_and_propagates_errors() {
+        let mut reads = 0;
+        let result = poll_budget(8, || {
+            reads += 1;
+            Ok(if reads == 2 {
+                MonitorPoll::Path("/device".into())
+            } else {
+                MonitorPoll::Pending
+            })
+        })
+        .unwrap();
+        assert_eq!(result, MonitorPoll::Path("/device".into()));
+        assert_eq!(reads, 2);
+        assert_eq!(
+            poll_budget(1, || Ok(MonitorPoll::Empty)).unwrap(),
+            MonitorPoll::Empty
+        );
+        let error =
+            poll_budget(1, || Err(std::io::Error::from_raw_os_error(libc::EIO))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
     #[test]
     fn initial_add_is_suppressed_once_then_readd_passes() {
         let mut initial = initial(&[b"/sys/device"]);

@@ -317,8 +317,22 @@ fn forwards_to_engine(kind: EventKind, profile: Profile, config: &Config) -> boo
 }
 
 fn engine_input(kind: EventKind) -> Option<EngineInput> {
-    if let Some((code, state)) = key_event(kind) {
-        return Some(EngineInput::Key { code, state });
+    use wiiland_core::input::InputSource;
+    let key = match kind {
+        EventKind::Key(key) => Some((InputSource::Core, key)),
+        EventKind::NunchukKey(key) => Some((InputSource::Nunchuk, key)),
+        EventKind::ClassicControllerKey(key) => Some((InputSource::ClassicController, key)),
+        EventKind::ProControllerKey(key) => Some((InputSource::ProController, key)),
+        EventKind::DrumsKey(key) => Some((InputSource::Drums, key)),
+        EventKind::GuitarKey(key) => Some((InputSource::Guitar, key)),
+        _ => None,
+    };
+    if let Some((source, key)) = key {
+        return Some(EngineInput::Key {
+            source,
+            button: key.button,
+            state: key.state,
+        });
     }
     if let EventKind::Ir(values) = kind {
         return Some(EngineInput::Ir(IrFrame {
@@ -529,6 +543,37 @@ mod tests {
         assert_eq!(button_state(ButtonState::Released), Some(0));
         assert_eq!(button_state(ButtonState::Pressed), Some(1));
         assert_eq!(button_state(ButtonState::Repeated), Some(2));
+    }
+
+    #[test]
+    fn hid_key_sources_keep_shared_buttons_held_until_both_release() {
+        let mut engine = DeviceEngine::new(Config::default().try_into().unwrap(), Profile::GAMEPAD);
+        let pressed = wiiland_hid::ButtonEvent {
+            button: Button::A,
+            state: ButtonState::Pressed,
+        };
+        let released = wiiland_hid::ButtonEvent {
+            button: Button::A,
+            state: ButtonState::Released,
+        };
+        let mut actions = Vec::new();
+        for (kind, expected) in [
+            (EventKind::Key(pressed), Some(1)),
+            (EventKind::ClassicControllerKey(pressed), None),
+            (EventKind::Key(released), None),
+            (EventKind::ClassicControllerKey(released), Some(0)),
+        ] {
+            actions.clear();
+            engine.process(engine_input(kind).unwrap(), &mut actions);
+            let states: Vec<_> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    OutputAction::Key(_, _, state) => Some(*state),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(states, expected.into_iter().collect::<Vec<_>>());
+        }
     }
 
     #[test]

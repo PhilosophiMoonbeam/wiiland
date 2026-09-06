@@ -721,3 +721,135 @@ fn background_capture_preserves_partial_frames_and_cancellation_closes_lease() {
     server.join().unwrap();
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
+
+fn assert_timeout(error: ClientError) {
+    assert!(
+        matches!(error, ClientError::Io(ref error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)),
+        "expected timeout, got {error}"
+    );
+}
+
+#[test]
+fn event_poll_returns_between_fragments_and_retains_the_complete_notification() {
+    let (path, listener) = start_server("poll-fragments");
+    let (resume, resumed) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let request = read_request(&mut reader);
+        send(
+            &mut stream,
+            hello(request.id, PROTOCOL_MAJOR, PROTOCOL_MINOR),
+        );
+        resumed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let frame = notification_frame(7, 200);
+        stream.write_all(&frame[..20]).unwrap();
+        resumed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        stream.write_all(&frame[20..]).unwrap();
+    });
+    let mut client = Client::connect(&path).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .unwrap();
+    resume.send(()).unwrap();
+    assert!(client.poll_event().unwrap().is_none());
+    // This is the point where a capture worker can observe cancellation or its
+    // deadline, even though the peer has not finished the current frame.
+    resume.send(()).unwrap();
+    assert!(matches!(
+        client.next_event().unwrap(),
+        Notification::DeviceRemoved { sequence: 7, .. }
+    ));
+    drop(client);
+    server.join().unwrap();
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn partial_response_bytes_do_not_restart_a_request_deadline() {
+    let (path, listener) = start_server("response-deadline");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let request = read_request(&mut reader);
+        send(
+            &mut stream,
+            hello(request.id, PROTOCOL_MAJOR, PROTOCOL_MINOR),
+        );
+        let request = read_request(&mut reader);
+        for byte in encode_frame(&status(request.id)).unwrap() {
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    let mut client = Client::connect(&path).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_millis(80)))
+        .unwrap();
+    assert_timeout(client.status().unwrap_err());
+    drop(client);
+    server.join().unwrap();
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn notifications_do_not_restart_a_correlated_request_deadline() {
+    let (path, listener) = start_server("notification-deadline");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let request = read_request(&mut reader);
+        send(
+            &mut stream,
+            hello(request.id, PROTOCOL_MAJOR, PROTOCOL_MINOR),
+        );
+        let request = read_request(&mut reader);
+        for sequence in 0..32 {
+            if stream
+                .write_all(&notification_frame(sequence, 200))
+                .is_err()
+            {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = stream.write_all(&encode_frame(&status(request.id)).unwrap());
+    });
+    let mut client = Client::connect(&path).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_millis(80)))
+        .unwrap();
+    assert_timeout(client.status().unwrap_err());
+    drop(client);
+    server.join().unwrap();
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn slow_fragmented_hello_observes_the_total_handshake_deadline() {
+    let (path, listener) = start_server("hello-deadline");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let request = read_request(&mut reader);
+        for byte in encode_frame(&hello(request.id, PROTOCOL_MAJOR, PROTOCOL_MINOR)).unwrap() {
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(30));
+        }
+    });
+    let error = match Client::connect(&path) {
+        Ok(_) => panic!("a trickled Hello must exceed the handshake deadline"),
+        Err(error) => error,
+    };
+    assert_timeout(error);
+    server.join().unwrap();
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}

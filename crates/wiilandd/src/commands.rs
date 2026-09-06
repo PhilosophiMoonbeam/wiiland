@@ -226,6 +226,12 @@ fn calibrate_aim(cli: &Cli) -> Result<(), CommandError> {
             format!("wiilandd: cannot open {}: {}", path.display(), e),
         )
     })?;
+    iface.watch(true).map_err(|error| {
+        CommandError::new(
+            io_errno(&error).unsigned_abs() as i32,
+            format!("wiilandd: cannot watch calibration device: {error}"),
+        )
+    })?;
     let available = iface.available() & (InterfaceMask::ACCEL | InterfaceMask::MOTION_PLUS);
     if available.is_empty() {
         return Err(CommandError::new(
@@ -259,11 +265,7 @@ fn calibrate_aim(cli: &Cli) -> Result<(), CommandError> {
     let mut motion = CalibrationStats::new();
     while Instant::now() < deadline {
         match iface.dispatch() {
-            Ok(event) => match event.kind {
-                EventKind::Accel(value) => accel.add([value.x, value.y, value.z]),
-                EventKind::MotionPlus(value) => motion.add([value.x, value.y, value.z]),
-                _ => {}
-            },
+            Ok(event) => collect_calibration_event(event.kind, &mut accel, &mut motion)?,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(20))
             }
@@ -307,6 +309,24 @@ fn calibrate_aim(cli: &Cli) -> Result<(), CommandError> {
         print_calibration("aim-motion-plus-bias", c);
     } else {
         println!("# warning: MotionPlus calibration unavailable or unstable");
+    }
+    Ok(())
+}
+fn collect_calibration_event(
+    event: EventKind,
+    accel: &mut CalibrationStats,
+    motion: &mut CalibrationStats,
+) -> Result<(), CommandError> {
+    match event {
+        EventKind::Accel(value) => accel.add([value.x, value.y, value.z]),
+        EventKind::MotionPlus(value) => motion.add([value.x, value.y, value.z]),
+        EventKind::Watch | EventKind::Gone => {
+            return Err(CommandError::new(
+                libc::ENODEV,
+                "wiilandd: calibration interrupted by a device or interface change; reconnect and retry",
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -555,6 +575,26 @@ fn self_test() -> Result<(), CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibration_rejects_lifecycle_changes_even_after_stable_samples() {
+        for interruption in [EventKind::Watch, EventKind::Gone] {
+            let mut accel = CalibrationStats::new();
+            let mut motion = CalibrationStats::new();
+            for _ in 0..16 {
+                collect_calibration_event(
+                    EventKind::Accel(wiiland_hid::Axis3 { x: 1, y: 2, z: 3 }),
+                    &mut accel,
+                    &mut motion,
+                )
+                .unwrap();
+            }
+            assert!(accel.finish().is_some());
+            let error =
+                collect_calibration_event(interruption, &mut accel, &mut motion).unwrap_err();
+            assert_eq!(error.code(), libc::ENODEV);
+        }
+    }
 
     #[test]
     fn normal_run_resolves_numeric_device_before_runtime() {

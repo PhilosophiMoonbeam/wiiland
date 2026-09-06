@@ -1,151 +1,269 @@
-//! Application-side live capture. Calibration is computed from daemon samples.
-use crate::{model::ConfigModel, process::ProcessResult};
+//! Live application services: typed results, worker-owned calibration windows.
+use crate::model::ConfigModel;
+use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+};
 use std::time::{Duration, Instant};
-use wiiland_core::{TraceFilter, calibration::CalibrationStats};
-use wiiland_ipc::{InputPayload, Notification, Session, SessionEvent};
+use wiiland_core::{SensorCalibration, TraceFilter, calibration::CalibrationStats};
+use wiiland_ipc::{
+    CaptureConnection, ClientError, DeviceInfo, Diagnostics, InputPayload, Notification, Session,
+    SessionEvent, Status,
+};
 
-pub struct Capture {
-    session: Session,
-    filter: TraceFilter,
-    duration: Option<Duration>,
-    started: Option<Instant>,
-    accel: CalibrationStats,
-    motion: CalibrationStats,
-    failed: Option<String>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalibrationResult {
+    pub accel: Option<SensorCalibration>,
+    pub motion_plus: Option<SensorCalibration>,
 }
+
+#[derive(Debug)]
+pub enum CaptureResult {
+    TraceStopped,
+    Calibrated(CalibrationResult),
+}
+
+enum CaptureKind {
+    Trace {
+        session: Box<Session>,
+        filter: TraceFilter,
+        failed: Option<String>,
+    },
+    Calibration(CalibrationWorker),
+}
+pub struct Capture(CaptureKind);
 impl Capture {
     pub fn start(selector: String, filter: TraceFilter, duration: Option<Duration>) -> Self {
-        Self::with_session(
-            Session::start(None, selector, duration.is_some()),
-            filter,
-            duration,
-        )
+        Self::with_socket(None, selector, filter, duration)
     }
-    fn with_session(session: Session, filter: TraceFilter, duration: Option<Duration>) -> Self {
-        Self {
-            session,
-            filter,
-            duration,
-            started: None,
-            accel: CalibrationStats::new(),
-            motion: CalibrationStats::new(),
-            failed: None,
-        }
+    fn with_socket(
+        socket: Option<PathBuf>,
+        selector: String,
+        filter: TraceFilter,
+        duration: Option<Duration>,
+    ) -> Self {
+        Self(match duration {
+            Some(duration) => {
+                CaptureKind::Calibration(CalibrationWorker::start(socket, selector, duration))
+            }
+            None => CaptureKind::Trace {
+                session: Box::new(Session::start(socket, selector, false)),
+                filter,
+                failed: None,
+            },
+        })
     }
     pub fn cancel(&self) {
-        self.session.cancel();
+        match &self.0 {
+            CaptureKind::Trace { session, .. } => session.cancel(),
+            CaptureKind::Calibration(worker) => worker.cancel(),
+        }
     }
-    pub fn poll(&mut self, model: &mut ConfigModel) -> Option<ProcessResult> {
-        // Both the IPC worker and this per-frame drain have fixed bounds.
-        for _ in 0..256 {
-            let Ok(event) = self.session.try_recv() else {
-                break;
-            };
-            match event {
-                SessionEvent::Connected { status, devices } => {
-                    model.append_output(&format!(
-                        "Connected to wiilandd {} (pid {}), {} capture device(s)\n",
-                        status.daemon_version,
-                        status.pid,
-                        devices.len()
-                    ));
-                    self.started = Some(Instant::now());
+    pub fn poll(&mut self, model: &mut ConfigModel) -> Option<Result<CaptureResult, String>> {
+        match &mut self.0 {
+            CaptureKind::Calibration(worker) => {
+                if let Ok((status, devices)) = worker.connected.try_recv() {
+                    connected(model, &status, &devices);
                 }
-                SessionEvent::Notification(Notification::Input {
-                    sequence,
-                    syspath,
-                    timestamp,
-                    payload,
-                }) => {
-                    if self.duration.is_some() {
-                        if matches!(payload, InputPayload::Watch | InputPayload::Gone) {
-                            self.failed = Some(
-                                "Device interfaces changed during calibration; capture again"
-                                    .into(),
-                            );
-                            self.session.cancel();
-                        }
-                        match payload {
-                            InputPayload::Accel(v) => self.accel.add([v.x, v.y, v.z]),
-                            InputPayload::MotionPlus(v) => self.motion.add([v.x, v.y, v.z]),
-                            _ => {}
-                        }
-                    } else if self.filter.matches(payload.event_code()) {
-                        model.append_output(&format!(
-                            "seq={sequence} time={}.{:06} device={syspath} {payload:?}\n",
-                            timestamp.seconds, timestamp.micros
-                        ));
+                match worker.result.try_recv() {
+                    Ok(result) => Some(result.map(CaptureResult::Calibrated)),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("Calibration worker stopped without a result".into()))
                     }
                 }
-                SessionEvent::Notification(Notification::DeviceRemoved { syspath, .. }) => {
-                    self.failed = Some(format!("Device disconnected: {syspath}"));
-                    self.session.cancel();
+            }
+            CaptureKind::Trace {
+                session,
+                filter,
+                failed,
+            } => {
+                for _ in 0..256 {
+                    let Ok(event) = session.try_recv() else {
+                        break;
+                    };
+                    match event {
+                        SessionEvent::Connected { status, devices } => {
+                            connected(model, &status, &devices)
+                        }
+                        SessionEvent::Notification(Notification::Input {
+                            sequence,
+                            syspath,
+                            timestamp,
+                            payload,
+                        }) => {
+                            if filter.matches(payload.event_code()) {
+                                model.append_output(&format!(
+                                    "seq={sequence} time={}.{:06} device={syspath} {payload:?}\n",
+                                    timestamp.seconds, timestamp.micros
+                                ));
+                            }
+                        }
+                        SessionEvent::Notification(Notification::DeviceRemoved {
+                            syspath, ..
+                        }) => {
+                            *failed = Some(format!("Device disconnected: {syspath}"));
+                            session.cancel();
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
+                session.try_finish().ok().map(|result| {
+                    result.map_err(|error| format!("Daemon capture: {error}"))?;
+                    if let Some(error) = failed.take() {
+                        return Err(error);
+                    }
+                    Ok(CaptureResult::TraceStopped)
+                })
             }
         }
-        if self
-            .duration
-            .zip(self.started)
-            .is_some_and(|(duration, start)| start.elapsed() >= duration)
-        {
-            self.session.cancel();
-        }
-        let result = self.session.try_finish().ok()?;
-        if let Err(error) = result {
-            return Some(ProcessResult::unavailable(format!(
-                "Daemon capture: {error}"
-            )));
-        }
-        if let Some(error) = self.failed.take() {
-            return Some(ProcessResult::unavailable(error));
-        }
-        let mut output = String::new();
-        if self.duration.is_some() {
-            for (name, stats) in [
-                ("aim-accel-zero", &self.accel),
-                ("aim-motion-plus-bias", &self.motion),
-            ] {
-                if let Some(value) = stats.finish() {
-                    output.push_str(&format!(
-                        "{name}-x={}\n{name}-y={}\n{name}-z={}\n",
-                        value.x, value.y, value.z
-                    ));
+    }
+}
+fn connected(model: &mut ConfigModel, status: &Status, devices: &[DeviceInfo]) {
+    model.append_output(&format!(
+        "Connected to wiilandd {} (pid {}), {} capture device(s)\n",
+        status.daemon_version,
+        status.pid,
+        devices.len()
+    ));
+}
+
+struct CalibrationWorker {
+    cancelled: Arc<AtomicBool>,
+    connected: Receiver<(Status, Vec<DeviceInfo>)>,
+    result: Receiver<Result<CalibrationResult, String>>,
+}
+impl CalibrationWorker {
+    fn start(socket: Option<PathBuf>, selector: String, duration: Duration) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let (connected, connection) = mpsc::sync_channel(1);
+        let (done, result) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut capture =
+                    CaptureConnection::connect_cancellable(socket, &selector, true, || {
+                        stop.load(Ordering::Relaxed)
+                    })
+                    .map_err(|error| format!("Daemon capture: {error}"))?;
+                let _ = connected.send((capture.status().clone(), capture.devices().to_vec()));
+                let deadline = Instant::now() + duration;
+                let mut samples = CalibrationSamples::default();
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return Err("Capture cancelled".into());
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    capture
+                        .set_read_timeout(Some(remaining.min(Duration::from_millis(50))))
+                        .map_err(|error| error.to_string())?;
+                    match capture.next_event() {
+                        Ok(Some(event)) => samples.observe(event)?,
+                        Ok(None) => {}
+                        Err(ClientError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(error) => return Err(format!("Daemon capture: {error}")),
+                    }
                 }
-            }
-            if output.is_empty() {
-                return Some(ProcessResult::unavailable(
-                    "No stable sensor samples; keep the controller still and capture again",
-                ));
-            }
+                // The connection and its leases are dropped before result delivery.
+                samples.finish()
+            })();
+            let _ = done.send(result);
+        });
+        Self {
+            cancelled,
+            connected: connection,
+            result,
         }
-        Some(ProcessResult {
-            success: true,
-            code: Some(0),
-            stdout: output.into_bytes(),
-            stderr: Vec::new(),
-            error: None,
-        })
+    }
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+impl Drop for CalibrationWorker {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
-pub struct Query(std::sync::mpsc::Receiver<Result<String, String>>, bool);
+#[derive(Default)]
+struct CalibrationSamples {
+    accel: CalibrationStats,
+    motion: CalibrationStats,
+}
+impl CalibrationSamples {
+    fn observe(&mut self, event: Notification) -> Result<(), String> {
+        match event {
+            Notification::Input { payload, .. } => match payload {
+                InputPayload::Accel(v) => self.accel.add([v.x, v.y, v.z]),
+                InputPayload::MotionPlus(v) => self.motion.add([v.x, v.y, v.z]),
+                InputPayload::Watch | InputPayload::Gone => {
+                    return Err(
+                        "Device interfaces changed during calibration; capture again".into(),
+                    );
+                }
+                _ => {}
+            },
+            Notification::DeviceRemoved { syspath, .. } => {
+                return Err(format!("Device disconnected: {syspath}"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn finish(self) -> Result<CalibrationResult, String> {
+        let result = CalibrationResult {
+            accel: self.accel.finish(),
+            motion_plus: self.motion.finish(),
+        };
+        if result.accel.is_none() && result.motion_plus.is_none() {
+            Err("No stable sensor samples; keep the controller still and capture again".into())
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+pub enum QueryResult {
+    Status {
+        status: Status,
+        diagnostics: Diagnostics,
+        config: String,
+    },
+    Devices(Vec<DeviceInfo>),
+}
+pub struct Query(Receiver<Result<QueryResult, String>>, bool);
 impl Query {
     pub fn start(devices: bool) -> Self {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result = (|| {
                 let mut client = wiiland_ipc::Client::connect_default()?;
                 client.set_read_timeout(Some(Duration::from_secs(2)))?;
                 client.set_write_timeout(Some(Duration::from_secs(2)))?;
                 if devices {
-                    Ok(client.devices()?.iter().enumerate().map(|(index, device)| format!("{}\t{}\t{:?}\n", index + 1, device.syspath, device.profile)).collect())
+                    Ok(QueryResult::Devices(client.devices()?))
                 } else {
-                    let status = client.status()?;
-                    let health = client.diagnostics()?;
-                    Ok(format!("wiilandd {} (pid {}): {} device(s)\ntrace drops={} lifecycle drops={} max pointer lateness={}us max dispatch={}us\nRunning configuration:\n{}", status.daemon_version, status.pid, status.device_count, health.trace_records_dropped, health.lifecycle_records_dropped, health.max_pointer_lateness_us, health.max_dispatch_duration_us, client.config()?))
+                    Ok(QueryResult::Status {
+                        status: client.status()?,
+                        diagnostics: client.diagnostics()?,
+                        config: client.config()?,
+                    })
                 }
-            })().map_err(|error: wiiland_ipc::ClientError| format!("Cannot query running daemon: {error}. Start or upgrade the service and retry."));
+            })()
+            .map_err(|error: ClientError| {
+                format!(
+                    "Cannot query running daemon: {error}. Start or upgrade the service and retry."
+                )
+            });
             let _ = sender.send(result);
         });
         Self(receiver, devices)
@@ -153,8 +271,14 @@ impl Query {
     pub fn is_status(&self) -> bool {
         !self.1
     }
-    pub fn poll(&self) -> Option<Result<String, String>> {
-        self.0.try_recv().ok()
+    pub fn poll(&self) -> Option<Result<QueryResult, String>> {
+        match self.0.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                Some(Err("Daemon query worker stopped without a result".into()))
+            }
+        }
     }
 }
 
@@ -168,7 +292,7 @@ mod tests {
         Timestamp,
     };
 
-    fn calibration_capture(interrupted: bool) -> ProcessResult {
+    fn calibration_capture(interrupted: bool) -> Result<CaptureResult, String> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("capture.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -222,7 +346,7 @@ mod tests {
                     break;
                 }
             }
-            for sequence in 0..32 {
+            for sequence in 0..1024 {
                 let axis = Axis3 {
                     x: 10,
                     y: 20,
@@ -251,7 +375,7 @@ mod tests {
             }
             if interrupted {
                 let notification = Notification::DeviceRemoved {
-                    sequence: 32,
+                    sequence: 1024,
                     syspath: device.syspath,
                     reason: wiiland_ipc::RemovalReason::Gone,
                 };
@@ -265,37 +389,39 @@ mod tests {
             let mut bytes = Vec::new();
             assert_eq!(reader.read_until(b'\n', &mut bytes).unwrap(), 0);
         });
-        let mut capture = Capture::with_session(
-            Session::start(Some(path), "1".into(), true),
+        let mut capture = Capture::with_socket(
+            Some(path),
+            "1".into(),
             TraceFilter::All,
-            Some(Duration::from_millis(30)),
+            Some(Duration::from_millis(200)),
         );
+        // Wait for the server to observe lease release without polling the UI.
+        // More samples than the UI queue can hold must still calibrate successfully.
+        server.join().unwrap();
         let mut model = ConfigModel::new(dir.path().join("config"));
         let deadline = Instant::now() + Duration::from_secs(3);
-        let result = loop {
+        loop {
             if let Some(result) = capture.poll(&mut model) {
                 break result;
             }
             assert!(Instant::now() < deadline, "capture did not finish");
             std::thread::sleep(Duration::from_millis(5));
-        };
-        server.join().unwrap();
-        result
+        }
     }
 
     #[test]
     fn daemon_samples_produce_independent_complete_calibration_triples() {
         let result = calibration_capture(false);
-        assert!(result.success, "{:?}", result.error);
-        let parsed = wiiland_core::Config::parse_bytes("capture", &result.stdout).unwrap();
-        assert_eq!(parsed.aim_accel_zero.unwrap().x, 10);
-        assert_eq!(parsed.aim_motion_plus_bias.unwrap().z, 30);
+        let CaptureResult::Calibrated(result) = result.unwrap() else {
+            panic!("expected calibration");
+        };
+        assert_eq!(result.accel.unwrap().x, 10);
+        assert_eq!(result.motion_plus.unwrap().z, 30);
     }
 
     #[test]
     fn device_loss_rejects_even_a_previously_stable_capture() {
         let result = calibration_capture(true);
-        assert!(!result.success);
-        assert!(result.stdout.is_empty());
+        assert!(result.unwrap_err().contains("disconnected"));
     }
 }

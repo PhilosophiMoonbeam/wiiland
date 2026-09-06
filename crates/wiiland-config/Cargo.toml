@@ -10,6 +10,7 @@ name = "wiiland-config"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 wiiland-ipc = { path = "../wiiland-ipc" }
 eframe.workspace = true
 egui.workspace = true

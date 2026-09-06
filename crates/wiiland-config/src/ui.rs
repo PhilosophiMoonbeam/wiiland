@@ -2,12 +2,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
-use tempfile::NamedTempFile;
 use wiiland_core::{
     AimActivation, AimMode, AimSource, DesktopAction, DeviceRuleKind, IrAimMapping, IrTracking,
     Profile, SensorCalibration,
 };
 
+use crate::config_task::{ConfigEvent, ConfigTask};
+use crate::live::{CalibrationResult, CaptureResult, QueryResult};
 use crate::model::{self, ApplyCompletion, CalibrationTransaction, ConfigModel, TransactionKind};
 use crate::process::{self, ProcessEvent, ProcessResult, ProcessTask};
 use crate::theme;
@@ -45,10 +46,9 @@ enum ValidationKind {
     Calibration,
 }
 
-struct ConfigTask {
+struct PendingConfig {
     transaction: model::Transaction,
-    process: ProcessTask,
-    _temporary: Option<NamedTempFile>,
+    worker: ConfigTask,
     restart_after_save: bool,
 }
 struct ValidationTask {
@@ -69,9 +69,15 @@ impl CaptureTask {
             Self::Daemon(task) => task.cancel(),
         }
     }
-    fn poll(&mut self, model: &mut ConfigModel) -> Option<ProcessResult> {
+    fn poll(
+        &mut self,
+        model: &mut ConfigModel,
+        kind: ValidationKind,
+    ) -> Option<Result<CaptureResult, String>> {
         match self {
-            Self::Direct(task) => poll_process(task, model),
+            Self::Direct(task) => {
+                poll_process(task, model).map(|result| decode_capture_result(result, kind))
+            }
             Self::Daemon(task) => task.poll(model),
         }
     }
@@ -118,7 +124,7 @@ impl PendingServiceActions {
 
 pub struct ControlCenter {
     pub model: ConfigModel,
-    config_task: Option<ConfigTask>,
+    config_task: Option<PendingConfig>,
     command_task: Option<(String, ProcessTask)>,
     service_task: Option<(String, ProcessTask)>,
     pending_service_actions: PendingServiceActions,
@@ -187,29 +193,15 @@ impl ControlCenter {
         }
     }
 
-    pub fn begin_load(&mut self, report_errors: bool) {
+    pub fn begin_load(&mut self, _report_errors: bool) {
         if self.config_task.is_some() {
             return;
         }
-        let target = self.model.config_path.clone();
-        let mut args = vec!["--dump-config".to_owned()];
-        args = process::configured_args(&target, ConfigModel::default_path().as_deref(), args);
         let Some(transaction) = self.model.begin(TransactionKind::Load, Vec::new()) else {
             return;
         };
-        let command = self.model.daemon_program().to_owned();
-        self.model
-            .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
-        self.config_task = Some(ConfigTask {
-            transaction,
-            process: ProcessTask::spawn_capturing_stdout(command, &args),
-            _temporary: None,
-            restart_after_save: false,
-        });
+        self.spawn_config_task(transaction, false);
         self.status = "Loading effective configuration".to_owned();
-        if report_errors {
-            self.status = "Loading effective configuration".to_owned();
-        }
     }
 
     fn begin_save(&mut self, restart: bool) {
@@ -217,70 +209,74 @@ impl ControlCenter {
             self.status = "Configuration has validation errors".to_owned();
             return;
         }
-        let target = self.model.config_path.clone();
-        if target.as_os_str().is_empty() {
+        if self.model.config_path.as_os_str().is_empty() {
             self.status = "Choose a configuration target".to_owned();
             return;
         }
         let bytes = self.model.render();
-        let parent = target
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            self.status = format!("Cannot prepare config validation: {error}");
-            return;
-        }
-        let mut temporary = match NamedTempFile::new_in(parent) {
-            Ok(file) => file,
-            Err(error) => {
-                self.status = format!("Cannot prepare config validation: {error}");
-                return;
-            }
-        };
-        if let Err(error) = std::io::Write::write_all(&mut temporary, &bytes)
-            .and_then(|_| temporary.as_file().sync_all())
-        {
-            self.status = format!("Cannot prepare config validation: {error}");
-            return;
-        }
-        let args = vec![
-            "--check-config".to_owned(),
-            "--config".to_owned(),
-            temporary.path().to_string_lossy().into_owned(),
-        ];
         let Some(transaction) = self.model.begin(TransactionKind::Save, bytes) else {
             return;
         };
-        let command = self.model.daemon_program().to_owned();
-        self.model
-            .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
-        self.config_task = Some(ConfigTask {
-            transaction,
-            process: ProcessTask::spawn(command, &args),
-            _temporary: Some(temporary),
-            restart_after_save: restart,
-        });
+        self.spawn_config_task(transaction, restart);
         self.status = if restart {
             "Validating configuration before save (restart requested)".to_owned()
         } else {
             "Validating configuration before save".to_owned()
         };
     }
+
+    fn spawn_config_task(&mut self, transaction: model::Transaction, restart: bool) {
+        let worker = ConfigTask::spawn(
+            transaction.clone(),
+            self.model.daemon_program().to_owned(),
+            ConfigModel::default_path(),
+        );
+        self.config_task = Some(PendingConfig {
+            transaction,
+            worker,
+            restart_after_save: restart,
+        });
+    }
+
     fn poll_config_task(&mut self) {
         let Some(task) = self.config_task.as_ref() else {
             return;
         };
-        let result = match poll_process(&task.process, &mut self.model) {
-            Some(result) => result,
-            None => return,
+        let mut completion = None;
+        for _ in 0..64 {
+            match task.worker.try_recv() {
+                Ok(ConfigEvent::Command { program, args }) => self.model
+                    .append_output(&format!("$ {} {}\n", program, shell_args(&args))),
+                Ok(ConfigEvent::Stdout(bytes) | ConfigEvent::Stderr(bytes)) => self.model
+                    .append_output(&String::from_utf8_lossy(&bytes)),
+                Ok(ConfigEvent::OmittedOutput(bytes)) => self.model.append_output(&format!(
+                    "\nConfiguration log omitted {bytes} bytes while the UI was busy; validation results were retained.\n"
+                )),
+                Ok(ConfigEvent::Finished(result)) => {
+                    completion = Some(result);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    completion = Some(model::Completion::new(&task.transaction, Err(model::ConfigFailure {
+                        stage: model::ConfigFailureStage::Worker,
+                        message: "Configuration worker disconnected".to_owned(),
+                    })));
+                    break;
+                }
+            }
+        }
+        let Some(completion) = completion else {
+            return;
         };
         let task = self.config_task.take().expect("task exists");
         let restart = task.restart_after_save
             && task.transaction.kind == TransactionKind::Save
             && !self.model.is_explicit_target(&task.transaction.target);
-        self.append_result_error(&result);
-        let completion = process::transaction_completion(&task.transaction, result);
+        if let Err(error) = &completion.result {
+            self.model
+                .append_output(&format!("Configuration error: {error}\n"));
+        }
         let outcome = self.model.finish(&completion);
         match outcome {
             ApplyCompletion::Applied => {
@@ -290,12 +286,22 @@ impl ControlCenter {
                 }
             }
             ApplyCompletion::Stale => {
-                self.status = "Completion discarded because the form or target changed".to_owned()
+                self.status = match task.transaction.kind {
+                    TransactionKind::Load => {
+                        "Load discarded because the form or target changed".to_owned()
+                    }
+                    TransactionKind::Save => {
+                        "Captured configuration saved; newer edits or target remain unchanged"
+                            .to_owned()
+                    }
+                }
             }
             ApplyCompletion::Failed => {
                 self.output_open = true;
-                self.status =
-                    "Configuration operation failed; existing data was preserved".to_owned()
+                self.status = match &completion.result {
+                    Err(error) => format!("Configuration operation failed: {error}"),
+                    Ok(_) => "Configuration operation returned an unexpected result".to_owned(),
+                };
             }
         }
         if restart && outcome == ApplyCompletion::Applied {
@@ -534,7 +540,7 @@ impl ControlCenter {
         let Some(task) = self.validation_task.as_mut() else {
             return;
         };
-        let result = match task.process.poll(&mut self.model) {
+        let result = match task.process.poll(&mut self.model, task.kind) {
             Some(result) => result,
             None => return,
         };
@@ -546,20 +552,31 @@ impl ControlCenter {
             self.status = "Capture stopped".to_owned();
             return;
         }
-        self.append_result_error(&result);
+        if let Err(error) = &result {
+            self.model.append_output(&format!("{error}\n"));
+        }
         match task.kind {
             ValidationKind::Trace => {
-                self.status = if result.success {
-                    "Trace stopped".to_owned()
+                self.status = if result.is_ok() {
+                    "Trace stopped"
                 } else {
-                    "Trace failed".to_owned()
-                };
+                    "Trace failed"
+                }
+                .to_owned();
             }
             ValidationKind::Calibration => {
                 let ownership = task
                     .calibration
                     .expect("calibration task carries captured ownership");
-                self.complete_calibration(ownership, result.success, &result.stdout);
+                self.complete_calibration(
+                    ownership,
+                    result.and_then(|result| match result {
+                        CaptureResult::Calibrated(value) => Ok(value),
+                        CaptureResult::TraceStopped => {
+                            Err("Capture returned no calibration".into())
+                        }
+                    }),
+                );
             }
         }
     }
@@ -567,44 +584,27 @@ impl ControlCenter {
     fn complete_calibration(
         &mut self,
         ownership: CalibrationOwnership,
-        success: bool,
-        bytes: &[u8],
+        result: Result<CalibrationResult, String>,
     ) {
         let model_owned = self.model.finish_calibration(&ownership.transaction);
         let device_owned = self.trace_device.trim() == ownership.device.as_str();
-        if !success {
-            self.status = "Calibration failed".to_owned();
-        } else if !model_owned || !device_owned {
-            self.status =
-                "Calibration discarded because the form, target, or capture changed".to_owned();
-        } else if self.apply_calibration(bytes) {
-            self.status = "Calibration values applied; save to persist them".to_owned();
-        } else {
-            self.status = "Calibration succeeded".to_owned();
-        }
-    }
-
-    fn apply_calibration(&mut self, bytes: &[u8]) -> bool {
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return false;
-        };
-        let mut next = self.model.config.clone();
-        let mut changed = false;
-        for line in text.lines() {
-            let line = line.trim();
-            if (line.starts_with("aim-accel-zero-")
-                || line.starts_with("aim-motion-plus-bias-")
-                || line.starts_with("aim-calibration-duration="))
-                && next.apply_line("calibration-output", 1, line).is_ok()
-            {
-                changed = true;
+        match result {
+            Err(_) => self.status = "Calibration failed".to_owned(),
+            Ok(_) if !model_owned || !device_owned => {
+                self.status =
+                    "Calibration discarded because the form, target, or capture changed".to_owned();
+            }
+            Ok(value) => {
+                if let Some(accel) = value.accel {
+                    self.model.config.aim_accel_zero = Some(accel);
+                }
+                if let Some(motion) = value.motion_plus {
+                    self.model.config.aim_motion_plus_bias = Some(motion);
+                }
+                self.model.mark_dirty();
+                self.status = "Calibration values applied; save to persist them".to_owned();
             }
         }
-        if changed {
-            self.model.config = next;
-            self.model.mark_dirty();
-        }
-        changed
     }
 
     fn request_reload(&mut self) {
@@ -1133,19 +1133,37 @@ impl eframe::App for ControlCenter {
         self.poll_service();
         self.poll_validation();
         if let Some(result) = self.ipc_query.as_ref().and_then(crate::live::Query::poll) {
-            if self
-                .ipc_query
-                .as_ref()
-                .is_some_and(crate::live::Query::is_status)
+            if result.is_err()
+                && self
+                    .ipc_query
+                    .as_ref()
+                    .is_some_and(crate::live::Query::is_status)
             {
-                self.daemon_status = match &result {
-                    Ok(text) => text.lines().next().unwrap_or("Daemon connected").to_owned(),
-                    Err(_) => "Daemon unavailable · see activity log".to_owned(),
-                };
+                self.daemon_status = "Daemon unavailable · see activity log".to_owned();
             }
             self.ipc_query = None;
             match result {
-                Ok(text) => self.model.append_output(&text),
+                Ok(QueryResult::Status {
+                    status,
+                    diagnostics,
+                    config,
+                }) => {
+                    self.daemon_status = format!(
+                        "wiilandd {} (pid {}): {} device(s)",
+                        status.daemon_version, status.pid, status.device_count
+                    );
+                    self.model.append_output(&format!("{}\ntrace drops={} lifecycle drops={} max pointer lateness={}us max dispatch={}us\nRunning configuration:\n{}", self.daemon_status, diagnostics.trace_records_dropped, diagnostics.lifecycle_records_dropped, diagnostics.max_pointer_lateness_us, diagnostics.max_dispatch_duration_us, config));
+                }
+                Ok(QueryResult::Devices(devices)) => {
+                    for (index, device) in devices.iter().enumerate() {
+                        self.model.append_output(&format!(
+                            "{}\t{}\t{:?}\n",
+                            index + 1,
+                            device.syspath,
+                            device.profile
+                        ));
+                    }
+                }
                 Err(error) => self.model.append_output(&format!("{error}\n")),
             }
         }
@@ -1565,6 +1583,35 @@ fn poll_process(task: &ProcessTask, model: &mut ConfigModel) -> Option<ProcessRe
     }
 }
 
+fn decode_capture_result(
+    result: ProcessResult,
+    kind: ValidationKind,
+) -> Result<CaptureResult, String> {
+    if !result.success {
+        return Err(result
+            .error
+            .unwrap_or_else(|| format!("Capture process failed (exit {:?})", result.code)));
+    }
+    if kind == ValidationKind::Trace {
+        return Ok(CaptureResult::TraceStopped);
+    }
+    decode_calibration(&result.stdout).map(CaptureResult::Calibrated)
+}
+
+fn decode_calibration(bytes: &[u8]) -> Result<CalibrationResult, String> {
+    let config = wiiland_core::Config::parse_bytes("calibration-output", bytes)
+        .map_err(|error| error.to_string())?;
+    let value = CalibrationResult {
+        accel: config.aim_accel_zero,
+        motion_plus: config.aim_motion_plus_bias,
+    };
+    if value.accel.is_none() && value.motion_plus.is_none() {
+        Err("Capture returned no complete sensor calibration".into())
+    } else {
+        Ok(value)
+    }
+}
+
 fn service_query_status(result: &ProcessResult) -> &'static str {
     match std::str::from_utf8(&result.stdout).map(str::trim) {
         Ok("active") if result.success => "Running",
@@ -1653,6 +1700,31 @@ mod tests {
         );
     }
     #[test]
+    fn direct_calibration_rejects_partial_or_invalid_triples_before_applying() {
+        for bytes in [
+            b"aim-accel-zero-x=10\n".as_slice(),
+            b"aim-accel-zero-x=10\naim-accel-zero-y=no\naim-accel-zero-z=30\n".as_slice(),
+            b"# no stable samples\n".as_slice(),
+        ] {
+            let mut application = ControlCenter::new(ConfigModel::new(PathBuf::from(
+                "/tmp/unused-calibration.conf",
+            )));
+            let before = application.model.config.clone();
+            let transaction = application.model.begin_calibration().unwrap();
+            application.complete_calibration(
+                CalibrationOwnership {
+                    transaction,
+                    device: String::new(),
+                },
+                decode_calibration(bytes),
+            );
+            assert_eq!(application.model.config, before);
+            assert_eq!(application.status, "Calibration failed");
+            assert!(application.model.begin_calibration().is_some());
+        }
+    }
+
+    #[test]
     fn edited_calibration_completion_is_discarded() {
         let mut application = ControlCenter::new(ConfigModel::new(PathBuf::from(
             "/tmp/calibration-edit.conf",
@@ -1670,8 +1742,9 @@ mod tests {
 
         application.complete_calibration(
             ownership,
-            true,
-            b"aim-accel-zero-x=101\naim-accel-zero-y=102\naim-accel-zero-z=103\n",
+            decode_calibration(
+                b"aim-accel-zero-x=101\naim-accel-zero-y=102\naim-accel-zero-z=103\n",
+            ),
         );
 
         assert_eq!(application.model.config, edited);
@@ -1697,8 +1770,7 @@ mod tests {
 
         application.complete_calibration(
             ownership,
-            true,
-            b"aim-motion-plus-bias-x=11\naim-motion-plus-bias-y=12\naim-motion-plus-bias-z=13\n",
+            decode_calibration(b"aim-motion-plus-bias-x=11\naim-motion-plus-bias-y=12\naim-motion-plus-bias-z=13\n"),
         );
 
         assert_eq!(application.model.config, retargeted);

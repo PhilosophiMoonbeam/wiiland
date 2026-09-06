@@ -1,15 +1,15 @@
 use std::io::Read;
+use std::os::fd::{AsFd, AsRawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::model::{Completion, Transaction};
-
 const EVENT_QUEUE_CAPACITY: usize = 64;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 const CAPTURE_LIMIT: usize = 1024 * 1024;
+const PIPE_POLL_TIMEOUT_MS: i32 = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputStream {
@@ -115,14 +115,28 @@ impl ProcessTask {
 
             let stdout_thread = stdout.map(|stream| {
                 let sender = sender.clone();
+                let state = Arc::clone(&child_state);
                 thread::spawn(move || {
-                    read_stream(stream, OutputStream::Stdout, sender, stdout_capture_limit)
+                    read_stream(
+                        stream,
+                        OutputStream::Stdout,
+                        sender,
+                        stdout_capture_limit,
+                        &state,
+                    )
                 })
             });
             let stderr_thread = stderr.map(|stream| {
                 let sender = sender.clone();
+                let state = Arc::clone(&child_state);
                 thread::spawn(move || {
-                    read_stream(stream, OutputStream::Stderr, sender, stdout_capture_limit)
+                    read_stream(
+                        stream,
+                        OutputStream::Stderr,
+                        sender,
+                        stdout_capture_limit,
+                        &state,
+                    )
                 })
             });
 
@@ -190,6 +204,13 @@ impl ProcessTask {
         }
     }
 
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<ProcessEvent, mpsc::RecvTimeoutError> {
+        self.receiver
+            .as_ref()
+            .expect("process receiver is present until drop")
+            .recv_timeout(timeout)
+    }
+
     /// Request termination without blocking the UI thread. The worker owns the
     /// corresponding wait and reports the resulting exit status normally.
     pub fn terminate(&self) {
@@ -222,9 +243,10 @@ impl Drop for ProcessTask {
         // Closing the bounded event queue releases reader threads even if the UI
         // stopped draining output before the task was dropped.
         self.receiver.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // The worker owns and reaps the child before joining its pipe readers.
+        // Detach cleanup: descendants may retain those pipes, and neither their
+        // lifetime nor a pending spawn may block the application's event loop.
+        drop(self.worker.take());
     }
 }
 
@@ -235,14 +257,47 @@ struct ReaderResult {
 }
 
 fn read_stream(
-    mut stream: impl Read,
+    mut stream: impl Read + AsFd,
     output_stream: OutputStream,
     sender: SyncSender<ProcessEvent>,
     capture_limit: Option<usize>,
+    state: &Mutex<ChildState>,
 ) -> ReaderResult {
     let mut result = ReaderResult::default();
     let mut buffer = [0_u8; READ_CHUNK_SIZE];
     loop {
+        if lock_state(state).terminate_requested {
+            break;
+        }
+        // A descendant can inherit stdout/stderr after our direct child exits.
+        // Poll before reading so cancellation does not depend on that descendant
+        // writing again or closing its descriptors. This is the only reader.
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd and its borrowed
+        // descriptor remains owned by stream throughout this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, PIPE_POLL_TIMEOUT_MS) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            result.error = Some(format!("failed to poll {output_stream:?}: {error}"));
+            break;
+        }
+        if ready == 0 {
+            continue;
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            result.error = Some(format!("invalid {output_stream:?} descriptor"));
+            break;
+        }
+        if lock_state(state).terminate_requested {
+            break;
+        }
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(length) => {
@@ -325,22 +380,10 @@ pub fn configured_args(
     args
 }
 
-pub fn transaction_completion(transaction: &Transaction, result: ProcessResult) -> Completion {
-    Completion {
-        id: transaction.id,
-        kind: transaction.kind,
-        revision: transaction.revision,
-        target: transaction.target.clone(),
-        success: result.success,
-        code: result.code,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        captured: transaction.captured.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -348,6 +391,40 @@ mod tests {
 
     fn shell(script: &str) -> ProcessTask {
         ProcessTask::spawn("/bin/sh", &["-c".to_owned(), script.to_owned()])
+    }
+
+    #[test]
+    fn cancellation_releases_reader_while_an_inherited_pipe_stays_open() {
+        let mut descriptors = [-1; 2];
+        // SAFETY: descriptors has space for the two newly owned pipe handles.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned two distinct, valid descriptors, each transferred
+        // exactly once into a File. The writer represents an inheriting process.
+        let reader = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+        let mut inherited_writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+        let state = Arc::new(Mutex::new(ChildState::default()));
+        let reader_state = Arc::clone(&state);
+        let (output, events) = mpsc::sync_channel(1);
+        let (done, finished) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = read_stream(reader, OutputStream::Stdout, output, None, &reader_state);
+            done.send(result.error).unwrap();
+        });
+        inherited_writer.write_all(b"started").unwrap();
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ProcessEvent::Stdout(b"started".to_vec())
+        );
+        request_termination(&state);
+        assert_eq!(
+            finished
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reader waited for inherited pipe EOF"),
+            None
+        );
+        worker.join().unwrap();
+        // Keep the inherited writer alive until after cleanup is confirmed.
+        drop(inherited_writer);
     }
 
     #[test]
@@ -455,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_kills_and_reaps_child_not_yet_published() {
+    fn drop_returns_before_publication_and_worker_eventually_reaps_child() {
         let (task, spawned, publish) = ProcessTask::spawn_paused_before_publication(
             "/bin/sh",
             &["-c".to_owned(), "exec sleep 30".to_owned()],
@@ -463,21 +540,24 @@ mod tests {
         let pid = spawned
             .recv_timeout(Duration::from_secs(2))
             .expect("child pid");
-        let state = Arc::clone(&task.state);
-        let dropping = thread::spawn(move || drop(task));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !lock_state(&state).terminate_requested {
-            assert!(
-                Instant::now() < deadline,
-                "drop did not request termination"
-            );
-            thread::yield_now();
-        }
+        let (dropped, finished_drop) = mpsc::sync_channel(1);
+        let dropping = thread::spawn(move || {
+            drop(task);
+            dropped.send(()).unwrap();
+        });
+        // The worker cannot publish or reap yet. Drop must still return.
+        finished_drop
+            .recv_timeout(Duration::from_secs(2))
+            .expect("drop blocked on worker cleanup");
         publish.send(()).expect("release publication gate");
         dropping.join().expect("task drop");
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "child remained alive or unreaped after task drop"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child remained alive or unreaped after cancellation"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }

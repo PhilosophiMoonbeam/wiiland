@@ -11,3 +11,4 @@ name = "wiiland_hid"
 
 [dependencies]
 libc.workspace = true
+wiiland-core = { path = "../wiiland-core" }

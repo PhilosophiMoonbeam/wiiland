@@ -5,6 +5,33 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static STOP: AtomicBool = AtomicBool::new(false);
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Roll back exclusive ownership when signal installation fails partway through.
+struct InstallationGuard(bool);
+impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            INSTALLED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Workers inherit blocked daemon signals before their first instruction. Only
+/// the reactor thread may execute the handler, including during fd teardown.
+pub(crate) fn spawn_worker<F, T>(name: &str, task: F) -> io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let previous =
+        block_signals(&handled_signal_set()).map_err(|code| io::Error::from_raw_os_error(-code))?;
+    let worker = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(task);
+    restore_signal_mask(&previous).map_err(|code| io::Error::from_raw_os_error(-code))?;
+    worker
+}
 
 extern "C" fn on_signal(signo: libc::c_int) {
     let errno_location = unsafe { libc::__errno_location() };
@@ -31,6 +58,10 @@ pub struct SignalPipe {
 }
 impl SignalPipe {
     pub fn install() -> Result<Self, i32> {
+        INSTALLED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| -libc::EBUSY)?;
+        let mut ownership = InstallationGuard(true);
         let mut fds = [-1; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
             return Err(errno());
@@ -81,6 +112,7 @@ impl SignalPipe {
             return Err(error);
         }
 
+        ownership.0 = false;
         Ok(Self {
             read_fd: fds[0],
             write_fd: fds[1],
@@ -136,6 +168,7 @@ impl SignalPipe {
         }
         close_pipe([self.read_fd, self.write_fd]);
         let _ = restore_signal_mask(&previous_mask);
+        INSTALLED.store(false, Ordering::Release);
     }
 }
 impl Drop for SignalPipe {
@@ -156,19 +189,18 @@ fn handled_signal_set() -> libc::sigset_t {
 
 fn block_signals(set: &libc::sigset_t) -> Result<libc::sigset_t, i32> {
     let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sigprocmask(libc::SIG_BLOCK, set, &mut previous) } < 0 {
-        Err(errno())
+    let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, set, &mut previous) };
+    if result != 0 {
+        Err(-result)
     } else {
         Ok(previous)
     }
 }
 
 fn restore_signal_mask(previous: &libc::sigset_t) -> Result<(), i32> {
-    if unsafe { libc::sigprocmask(libc::SIG_SETMASK, previous, std::ptr::null_mut()) } < 0 {
-        Err(errno())
-    } else {
-        Ok(())
-    }
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous, std::ptr::null_mut()) };
+    if result != 0 { Err(-result) } else { Ok(()) }
 }
 
 fn publish_handler_state(write_fd: RawFd) {
@@ -196,6 +228,30 @@ fn errno() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_inherit_blocked_signals_and_parent_mask_is_restored() {
+        fn mask() -> [i32; 2] {
+            let mut empty: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut empty);
+            }
+            let current = block_signals(&empty).unwrap();
+            unsafe {
+                [
+                    libc::sigismember(&current, libc::SIGINT),
+                    libc::sigismember(&current, libc::SIGTERM),
+                ]
+            }
+        }
+        let before = mask();
+        let inherited = spawn_worker("wiiland-mask-test", mask)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(inherited, [1, 1]);
+        assert_eq!(mask(), before);
+    }
 
     #[test]
     fn handled_signal_set_contains_int_and_term() {

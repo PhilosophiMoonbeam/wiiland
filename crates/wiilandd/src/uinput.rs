@@ -250,14 +250,9 @@ impl<B: Backend> VirtualDevice<B> {
             created: false,
             kind,
         };
-        if let Err(e) = out.configure() {
-            out.backend.close(fd);
-            return Err(e);
-        }
-        if let Err(e) = out.backend.ioctl(fd, UI_DEV_CREATE, 0).map_err(errno) {
-            out.backend.close(fd);
-            return Err(e);
-        }
+        // `out` owns the descriptor from this point, including setup failures.
+        out.configure()?;
+        out.backend.ioctl(fd, UI_DEV_CREATE, 0).map_err(errno)?;
         out.created = true;
         Ok(out)
     }

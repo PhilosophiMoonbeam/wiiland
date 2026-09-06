@@ -45,7 +45,7 @@ impl DiagnosticWriter {
         let (done, finished) = mpsc::sync_channel(1);
         let dropped = Arc::new(AtomicU64::new(0));
         let counter = Arc::clone(&dropped);
-        std::thread::spawn(move || {
+        crate::signal::spawn_worker("wiiland-diagnostics", move || {
             let mut writer = writer();
             let mut reported = 0;
             for line in receiver {
@@ -70,7 +70,8 @@ impl DiagnosticWriter {
                 }
             }
             let _ = done.send(());
-        });
+        })
+        .expect("cannot start diagnostic writer");
         Self {
             sender: Some(DiagnosticSender { sender, dropped }),
             finished,

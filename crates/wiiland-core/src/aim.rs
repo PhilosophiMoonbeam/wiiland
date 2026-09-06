@@ -7,6 +7,7 @@ use crate::calibration::sensor_calibration_ready;
 use crate::config::{
     AimActivation, AimMode, AimSource, Config, IrAimMapping, IrRectangle, SensorCalibration,
 };
+use crate::input::Button;
 use crate::pointer::IrPoint;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -122,6 +123,7 @@ impl AimState {
     pub fn is_active(&self) -> bool {
         self.enabled() && (self.config.activation == AimActivation::Always || self.held)
     }
+    /// Forget tracking baselines while retaining the current activation key.
     pub fn reset(&mut self) -> AimResult {
         self.active_source = None;
         self.ir_active = false;
@@ -129,6 +131,11 @@ impl AimState {
         self.last_x = 0;
         self.last_y = 0;
         AimResult::reset()
+    }
+    /// Start a new input session after outputs or their input interfaces disappear.
+    pub fn reset_session(&mut self) -> AimResult {
+        self.held = false;
+        self.reset()
     }
     /// Update the configured activation key. Releasing it resets source,
     /// baselines, and smoothing; holding remains sticky until release.
@@ -141,9 +148,9 @@ impl AimState {
             return AimResult::NONE;
         }
         let expected = match self.config.activation {
-            AimActivation::B => 5,
-            AimActivation::Z => 20,
-            AimActivation::C => 19,
+            AimActivation::B => Button::B.code(),
+            AimActivation::Z => Button::Z.code(),
+            AimActivation::C => Button::C.code(),
             AimActivation::Always => u32::MAX,
         };
         if key != expected {

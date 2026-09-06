@@ -71,7 +71,8 @@ pub fn run(program: &str, selector: &str, socket: Option<PathBuf>) -> i32 {
             ));
         }
         app.info("Daemon capture: q quit, f freeze; hardware controls require --direct");
-        let session = Session::start(socket, path, true);
+        let session = Session::start_visualization(socket, path, true);
+        let mut coalesced = 0;
         loop {
             for _ in 0..256 {
                 let Ok(event) = session.try_recv() else {
@@ -108,6 +109,13 @@ pub fn run(program: &str, selector: &str, socket: Option<PathBuf>) -> i32 {
             }
             if let Ok(result) = session.try_finish() {
                 return result.map_err(io::Error::other);
+            }
+            let latest = session.coalesced_samples();
+            if latest != coalesced {
+                coalesced = latest;
+                app.info(format!(
+                    "Display caught up: {coalesced} older sensor samples replaced"
+                ));
             }
             terminal.draw(|frame| render::render(frame, &app))?;
             if event::poll(Duration::from_millis(16))? {

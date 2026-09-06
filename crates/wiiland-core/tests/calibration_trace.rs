@@ -12,6 +12,17 @@ use wiiland_core::trace::{
 };
 
 #[test]
+fn extreme_sensor_values_reject_an_unstable_window_without_overflow() {
+    let mut stats = CalibrationStats::new();
+    for _ in 0..AIM_CALIBRATION_MIN_SAMPLES {
+        stats.add([i32::MIN, 0, i32::MAX]);
+        stats.add([i32::MAX, 0, i32::MIN]);
+    }
+    assert_eq!(stats.jitter(), i32::MAX);
+    assert!(stats.finish().is_none());
+}
+
+#[test]
 fn calibration_accumulates_extrema_and_finishes_at_stability_boundaries() {
     let mut stats = CalibrationStats::new();
     assert_eq!(stats.samples, 0);

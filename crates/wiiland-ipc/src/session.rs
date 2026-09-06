@@ -1,13 +1,13 @@
 //! Bounded background IPC subscription for interactive consumers.
-use crate::{Client, ClientError, DeviceInfo, Notification, Status};
+use crate::{CaptureConnection, ClientError, DeviceInfo, InputPayload, Notification, Status};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, SyncSender, TryRecvError},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
 };
-use std::time::Duration;
 
 const EVENT_QUEUE: usize = 64;
 
@@ -23,7 +23,7 @@ pub enum SessionEvent {
 /// Owns a worker and its connection. Dropping cancels reads and releases capture
 /// leases, without waiting on the UI thread. Queue overflow terminates explicitly.
 pub struct Session {
-    events: Receiver<SessionEvent>,
+    events: Arc<EventQueue>,
     finished: Receiver<Result<(), ClientError>>,
     cancelled: Arc<AtomicBool>,
     pending_event: RefCell<Option<SessionEvent>>,
@@ -34,12 +34,29 @@ impl Session {
     /// Empty selection captures all currently known devices; single selects the
     /// first device when the selector is empty. Otherwise use a syspath or ordinal.
     pub fn start(socket: Option<PathBuf>, selector: String, single: bool) -> Self {
-        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE);
+        Self::start_with_policy(socket, selector, single, DeliveryPolicy::Strict)
+    }
+
+    /// Keep recent sensor values when the UI falls behind. Button transitions
+    /// and lifecycle events are never coalesced; their overflow still fails.
+    pub fn start_visualization(socket: Option<PathBuf>, selector: String, single: bool) -> Self {
+        Self::start_with_policy(socket, selector, single, DeliveryPolicy::LatestSensors)
+    }
+
+    fn start_with_policy(
+        socket: Option<PathBuf>,
+        selector: String,
+        single: bool,
+        policy: DeliveryPolicy,
+    ) -> Self {
+        let events = Arc::new(EventQueue::new(policy));
+        let sender = Arc::clone(&events);
         let (done, finished) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&cancelled);
         std::thread::spawn(move || {
             let result = run(socket, selector, single, &sender, &stop);
+            sender.closed.store(true, Ordering::Release);
             let _ = done.send(result);
         });
         Self {
@@ -49,6 +66,10 @@ impl Session {
             pending_event: RefCell::new(None),
             pending_result: RefCell::new(None),
         }
+    }
+    /// Number of sensor samples replaced or evicted for a visualization.
+    pub fn coalesced_samples(&self) -> u64 {
+        self.events.coalesced.load(Ordering::Relaxed)
     }
     pub fn try_recv(&self) -> Result<SessionEvent, TryRecvError> {
         self.pending_event
@@ -85,53 +106,119 @@ impl Drop for Session {
     }
 }
 
-fn send(sender: &SyncSender<SessionEvent>, event: SessionEvent) -> Result<(), ClientError> {
-    sender
-        .try_send(event)
-        .map_err(|_| ClientError::SessionBacklogExceeded { limit: EVENT_QUEUE })
+#[derive(Clone, Copy)]
+enum DeliveryPolicy {
+    Strict,
+    LatestSensors,
+}
+
+struct EventQueue {
+    events: Mutex<VecDeque<SessionEvent>>,
+    policy: DeliveryPolicy,
+    coalesced: AtomicU64,
+    closed: AtomicBool,
+}
+impl EventQueue {
+    fn new(policy: DeliveryPolicy) -> Self {
+        Self {
+            events: Mutex::new(VecDeque::with_capacity(EVENT_QUEUE)),
+            policy,
+            coalesced: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+    fn send(&self, event: SessionEvent) -> Result<(), ClientError> {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if events.len() == EVENT_QUEUE {
+            if matches!(self.policy, DeliveryPolicy::LatestSensors) {
+                // Prefer replacing this sensor's previous value. Otherwise
+                // evict the oldest sensor, preserving every control transition.
+                let same = sensor_identity(&event).and_then(|identity| {
+                    events
+                        .iter()
+                        .position(|old| sensor_identity(old) == Some(identity))
+                });
+                if let Some(index) =
+                    same.or_else(|| events.iter().position(|old| sensor_identity(old).is_some()))
+                {
+                    events.remove(index);
+                    self.coalesced.fetch_add(1, Ordering::Relaxed);
+                } else if sensor_identity(&event).is_some() {
+                    // A queue consisting entirely of controls takes priority
+                    // over this new visualization sample.
+                    self.coalesced.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
+            if events.len() == EVENT_QUEUE {
+                return Err(ClientError::SessionBacklogExceeded { limit: EVENT_QUEUE });
+            }
+        }
+        events.push_back(event);
+        Ok(())
+    }
+    fn try_recv(&self) -> Result<SessionEvent, TryRecvError> {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        events.pop_front().ok_or_else(|| {
+            if self.closed.load(Ordering::Acquire) {
+                TryRecvError::Disconnected
+            } else {
+                TryRecvError::Empty
+            }
+        })
+    }
+}
+
+fn sensor_identity(event: &SessionEvent) -> Option<(&str, u32)> {
+    let SessionEvent::Notification(Notification::Input {
+        syspath, payload, ..
+    }) = event
+    else {
+        return None;
+    };
+    matches!(
+        payload,
+        InputPayload::Accel(_)
+            | InputPayload::Ir(_)
+            | InputPayload::BalanceBoard(_)
+            | InputPayload::MotionPlus(_)
+            | InputPayload::ProControllerMove(_)
+            | InputPayload::ClassicControllerMove(_)
+            | InputPayload::NunchukMove(_)
+            | InputPayload::DrumsMove(_)
+            | InputPayload::GuitarMove(_)
+    )
+    .then(|| (syspath.as_str(), payload.event_code()))
 }
 
 fn run(
     socket: Option<PathBuf>,
     selector: String,
     single: bool,
-    sender: &SyncSender<SessionEvent>,
+    sender: &EventQueue,
     stop: &AtomicBool,
 ) -> Result<(), ClientError> {
-    let mut client = match socket {
-        Some(path) => Client::connect(path)?,
-        None => Client::connect_default()?,
+    let connection = CaptureConnection::connect_cancellable(socket, &selector, single, || {
+        stop.load(Ordering::Relaxed)
+    });
+    let mut connection = match connection {
+        Err(_) if stop.load(Ordering::Relaxed) => return Ok(()),
+        result => result?,
     };
-    client.set_read_timeout(Some(Duration::from_secs(2)))?;
-    client.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let status = client.status()?;
-    let mut devices = select_devices(client.devices()?, &selector, single)?;
-    client.subscribe()?;
-    for device in &mut devices {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        *device = client.start_capture(&device.syspath)?;
-    }
-    let selected: Vec<String> = devices
-        .iter()
-        .map(|device| device.syspath.clone())
-        .collect();
-    send(sender, SessionEvent::Connected { status, devices })?;
-    client.set_read_timeout(Some(Duration::from_millis(100)))?;
+    sender.send(SessionEvent::Connected {
+        status: connection.status().clone(),
+        devices: connection.devices().to_vec(),
+    })?;
     while !stop.load(Ordering::Relaxed) {
-        match client.next_event() {
-            Ok(event) => {
-                let path = match &event {
-                    Notification::Input { syspath, .. }
-                    | Notification::DeviceRemoved { syspath, .. } => Some(syspath),
-                    Notification::DeviceAdded { device, .. } => Some(&device.syspath),
-                    _ => None,
-                };
-                if path.is_none_or(|path| selected.contains(path)) {
-                    send(sender, SessionEvent::Notification(event))?;
-                }
-            }
+        match connection.next_event() {
+            Ok(Some(event)) => sender.send(SessionEvent::Notification(event))?,
+            Ok(None) => {}
             Err(ClientError::Io(error))
                 if matches!(
                     error.kind(),
@@ -140,7 +227,6 @@ fn run(
             Err(error) => return Err(error),
         }
     }
-    // Closing the socket releases leases, including after partial setup failures.
     Ok(())
 }
 
@@ -187,9 +273,90 @@ pub fn select_devices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(sequence: u64, key: Option<u32>) -> SessionEvent {
+        SessionEvent::Notification(Notification::Input {
+            sequence,
+            syspath: "/sys/test".into(),
+            timestamp: crate::Timestamp {
+                seconds: 0,
+                micros: 0,
+            },
+            payload: key.map_or_else(
+                || {
+                    InputPayload::Accel(crate::Axis3 {
+                        x: sequence as i32,
+                        y: 0,
+                        z: 0,
+                    })
+                },
+                |state| InputPayload::Key(crate::ButtonEvent { code: 4, state }),
+            ),
+        })
+    }
+
+    #[test]
+    fn stalled_visualization_preserves_controls_and_latest_sensor_in_wire_order() {
+        let queue = EventQueue::new(DeliveryPolicy::LatestSensors);
+        queue.send(sample(0, Some(1))).unwrap();
+        for sequence in 1..=2000 {
+            queue.send(sample(sequence, None)).unwrap();
+        }
+        queue.send(sample(2001, Some(0))).unwrap();
+        queue
+            .send(SessionEvent::Notification(Notification::DeviceRemoved {
+                sequence: 2002,
+                syspath: "/sys/test".into(),
+                reason: crate::RemovalReason::Gone,
+            }))
+            .unwrap();
+        assert_eq!(queue.events.lock().unwrap().len(), EVENT_QUEUE);
+        assert_eq!(
+            queue.coalesced.load(Ordering::Relaxed),
+            2003 - EVENT_QUEUE as u64
+        );
+        let mut sequences = Vec::new();
+        let mut buttons = Vec::new();
+        while let Ok(event) = queue.try_recv() {
+            match event {
+                SessionEvent::Notification(Notification::Input {
+                    sequence, payload, ..
+                }) => {
+                    sequences.push(sequence);
+                    if let InputPayload::Key(button) = payload {
+                        buttons.push(button.state);
+                    }
+                }
+                SessionEvent::Notification(Notification::DeviceRemoved { sequence, .. }) => {
+                    sequences.push(sequence)
+                }
+                _ => panic!("unexpected event"),
+            }
+        }
+        assert_eq!(buttons, [1, 0]);
+        assert!(sequences.contains(&2000));
+        assert_eq!(sequences.last(), Some(&2002));
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn visualization_discards_samples_but_fails_explicitly_when_controls_overflow() {
+        let queue = EventQueue::new(DeliveryPolicy::LatestSensors);
+        for sequence in 0..EVENT_QUEUE as u64 {
+            queue.send(sample(sequence, Some(1))).unwrap();
+        }
+        queue.send(sample(1000, None)).unwrap();
+        assert_eq!(queue.coalesced.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            queue.send(sample(1001, Some(0))),
+            Err(ClientError::SessionBacklogExceeded { .. })
+        ));
+        assert_eq!(queue.events.lock().unwrap().len(), EVENT_QUEUE);
+    }
     #[test]
     fn full_queue_fails_explicitly_and_completion_waits_for_last_event() {
-        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE);
+        let events = Arc::new(EventQueue::new(DeliveryPolicy::Strict));
+        let sender = Arc::clone(&events);
         let (done, finished) = mpsc::sync_channel(1);
         let session = Session {
             events,
@@ -199,17 +366,12 @@ mod tests {
             pending_result: RefCell::new(None),
         };
         for _ in 0..EVENT_QUEUE {
-            send(
-                &sender,
-                SessionEvent::Notification(Notification::Unsupported),
-            )
-            .unwrap();
+            sender
+                .send(SessionEvent::Notification(Notification::Unsupported))
+                .unwrap();
         }
         assert!(matches!(
-            send(
-                &sender,
-                SessionEvent::Notification(Notification::Unsupported)
-            ),
+            sender.send(SessionEvent::Notification(Notification::Unsupported)),
             Err(ClientError::SessionBacklogExceeded { .. })
         ));
         done.send(Ok(())).unwrap();

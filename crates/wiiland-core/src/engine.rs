@@ -1,5 +1,6 @@
 //! Deterministic per-device processing. Hardware ownership and clocks live in adapters.
 use crate::aim::{AimConfig, AimResult, AimState};
+use crate::input::{Button, ButtonState, InputSource};
 use crate::mapping::{self, Abs3, MotionKind};
 use crate::pointer::{
     IrFrame, POINTER_DOWN, POINTER_LEFT, POINTER_RIGHT, POINTER_UP, PointerState,
@@ -24,8 +25,9 @@ pub enum OutputAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineInput {
     Key {
-        code: u32,
-        state: u32,
+        source: InputSource,
+        button: Button,
+        state: ButtonState,
     },
     Motion {
         kind: MotionKind,
@@ -34,7 +36,9 @@ pub enum EngineInput {
     Ir(IrFrame),
     /// One fixed 16ms pointer tick, supplied by the reactor or a replay.
     PointerTick,
-    /// Outputs are destroyed by the adapter when an interface disappears.
+    /// Release only this interface's held buttons while retaining other sources.
+    SourceRemoved(InputSource),
+    /// Start a new session after the adapter destroys the previous outputs.
     Reset,
 }
 
@@ -43,6 +47,7 @@ pub struct DeviceEngine {
     profile: Profile,
     pointer: PointerState,
     aim: AimState,
+    held: [u32; InputSource::ALL.len()],
 }
 
 impl DeviceEngine {
@@ -59,6 +64,7 @@ impl DeviceEngine {
             ),
             aim: AimState::new(AimConfig::from_config(c)),
             config,
+            held: [0; InputSource::ALL.len()],
         }
     }
 
@@ -71,7 +77,8 @@ impl DeviceEngine {
         match input {
             EngineInput::Reset => {
                 self.pointer.reset();
-                self.aim.reset();
+                self.aim.reset_session();
+                self.held.fill(0);
             }
             EngineInput::PointerTick => {
                 if self.pointer_active() {
@@ -79,7 +86,19 @@ impl DeviceEngine {
                     self.emit_pointer(delta.dx, delta.dy, output);
                 }
             }
-            EngineInput::Key { code, state } => self.key(code, state, output),
+            EngineInput::Key {
+                source,
+                button,
+                state,
+            } => self.key(source, button, state, output),
+            EngineInput::SourceRemoved(source) => {
+                let held = self.held[source.index()];
+                for button in Button::ALL {
+                    if held & button_bit(button) != 0 {
+                        self.key(source, button, ButtonState::Released, output);
+                    }
+                }
+            }
             EngineInput::Motion { kind, axes } => {
                 if needs_gamepad(self.profile, self.config.get()) {
                     let mapped = mapping::map_motion(kind, axes);
@@ -112,54 +131,94 @@ impl DeviceEngine {
         }
     }
 
-    fn key(&mut self, code: u32, state: u32, output: &mut Vec<OutputAction>) {
-        if state > 2 {
-            return;
+    fn held_buttons(&self) -> u32 {
+        self.held.iter().fold(0, |held, source| held | source)
+    }
+
+    fn desktop_key(&self, button: Button) -> Option<u16> {
+        let bindings = &self.config.get().desktop_bindings;
+        let action = match button {
+            Button::A => bindings.a,
+            Button::B => bindings.b,
+            Button::Plus => bindings.plus,
+            Button::Minus => bindings.minus,
+            Button::Home => bindings.home,
+            Button::One => bindings.one,
+            Button::Two => bindings.two,
+            _ => DesktopAction::Disabled,
+        };
+        match action {
+            DesktopAction::LeftClick => Some(0x110),
+            DesktopAction::RightClick => Some(0x111),
+            DesktopAction::Enter => Some(28),
+            DesktopAction::Escape => Some(1),
+            DesktopAction::Overview => Some(125),
+            DesktopAction::PageUp => Some(104),
+            DesktopAction::PageDown => Some(109),
+            DesktopAction::Disabled => None,
         }
-        if needs_gamepad(self.profile, self.config.get())
-            && let Some(mapped) = mapping::map_key(code)
-        {
-            output.push(OutputAction::Key(OutputDevice::Gamepad, mapped, state));
+    }
+
+    fn desktop_key_held(&self, held: u32, key: u16) -> bool {
+        Button::ALL
+            .into_iter()
+            .any(|button| held & button_bit(button) != 0 && self.desktop_key(button) == Some(key))
+    }
+
+    fn key(
+        &mut self,
+        source: InputSource,
+        button: Button,
+        state: ButtonState,
+        output: &mut Vec<OutputAction>,
+    ) {
+        let before = self.held_buttons();
+        let bit = button_bit(button);
+        match state {
+            ButtonState::Released => self.held[source.index()] &= !bit,
+            ButtonState::Pressed | ButtonState::Repeated => self.held[source.index()] |= bit,
+        }
+        let after = self.held_buttons();
+        let was_held = before & bit != 0;
+        let is_held = after & bit != 0;
+        if needs_gamepad(self.profile, self.config.get()) {
+            let mapped = mapping::map_button(button);
+            emit_key_transition(
+                OutputDevice::Gamepad,
+                mapped,
+                was_held,
+                is_held,
+                state,
+                output,
+            );
         }
         if self.profile.contains(Profile::DESKTOP) {
-            let bindings = &self.config.get().desktop_bindings;
-            let action = match code {
-                4 => bindings.a,
-                5 => bindings.b,
-                6 => bindings.plus,
-                7 => bindings.minus,
-                8 => bindings.home,
-                9 => bindings.one,
-                10 => bindings.two,
-                _ => DesktopAction::Disabled,
-            };
-            let mapped = match action {
-                DesktopAction::LeftClick => Some(0x110),
-                DesktopAction::RightClick => Some(0x111),
-                DesktopAction::Enter => Some(28),
-                DesktopAction::Escape => Some(1),
-                DesktopAction::Overview => Some(125),
-                DesktopAction::PageUp => Some(104),
-                DesktopAction::PageDown => Some(109),
-                DesktopAction::Disabled => None,
-            };
-            if let Some(mapped) = mapped {
-                output.push(OutputAction::Key(OutputDevice::Desktop, mapped, state));
+            if let Some(mapped) = self.desktop_key(button) {
+                emit_key_transition(
+                    OutputDevice::Desktop,
+                    mapped,
+                    self.desktop_key_held(before, mapped),
+                    self.desktop_key_held(after, mapped),
+                    state,
+                    output,
+                );
             }
-            let bit = match code {
-                0 => POINTER_LEFT,
-                1 => POINTER_RIGHT,
-                2 => POINTER_UP,
-                3 => POINTER_DOWN,
+            let pointer_bit = match button {
+                Button::Left => POINTER_LEFT,
+                Button::Right => POINTER_RIGHT,
+                Button::Up => POINTER_UP,
+                Button::Down => POINTER_DOWN,
                 _ => 0,
             };
-            if bit != 0 {
-                let delta = self.pointer.update_key(bit, state != 0);
+            if pointer_bit != 0 && was_held != is_held {
+                let delta = self.pointer.update_key(pointer_bit, is_held);
                 self.emit_pointer(delta.dx, delta.dy, output);
             }
         }
-        let result = self.aim.activation_key(code, state != 0);
-        self.emit_aim(result, output);
+        if was_held != is_held {
+            let result = self.aim.activation_key(button.code(), is_held);
+            self.emit_aim(result, output);
+        }
     }
 
     fn emit_pointer(&self, dx: i32, dy: i32, output: &mut Vec<OutputAction>) {
@@ -192,6 +251,27 @@ impl DeviceEngine {
             AimMode::Off => {}
         }
     }
+}
+
+fn button_bit(button: Button) -> u32 {
+    1 << button.code()
+}
+
+fn emit_key_transition(
+    target: OutputDevice,
+    code: u16,
+    before: bool,
+    after: bool,
+    state: ButtonState,
+    output: &mut Vec<OutputAction>,
+) {
+    let state = match (before, after) {
+        (false, true) => ButtonState::Pressed,
+        (true, false) => ButtonState::Released,
+        (true, true) if state == ButtonState::Repeated => ButtonState::Repeated,
+        _ => return,
+    };
+    output.push(OutputAction::Key(target, code, state.value()));
 }
 
 pub fn needs_gamepad(profile: Profile, config: &Config) -> bool {
