@@ -14,9 +14,9 @@ calibration through daemon IPC, and controls the per-user systemd service.
 The initial window is 1180 by 780 pixels and cannot be resized below 760 by
 600.  The application id is
 .BR io.github.philosophimoonbeam.wiiland-config .
-The native window backend is selected by eframe for the current session; the
-Overview status reports Wayland when WAYLAND_DISPLAY is set, X11 when DISPLAY
-is set otherwise, and unknown when neither is set.
+The native window backend is selected by eframe for the current session.
+Overview's configuration details report Wayland when WAYLAND_DISPLAY is set,
+X11 when DISPLAY is set otherwise, and unknown when neither is set.
 .PP
 The frontend does not create input devices or run a private daemon.  All
 commands run asynchronously, with their standard output and standard error
@@ -46,28 +46,36 @@ Configuration values use the daemon's canonical key=value tokens.  See
 .BR wiilandd (1)
 for all accepted keys, ranges, defaults, and layering rules.
 .SH APPEARANCE AND NAVIGATION
-The pearl light palette and dusk dark palette share the logo's sea-glass
-accents.  Appearance selects Follow system, Pearl, or Dusk for this session.
-The sidebar becomes horizontal navigation in a narrow window.  Page content
-scrolls independently from the save controls and Activity log.
+Pearl uses a warm neutral canvas, opaque light cards, evergreen text, and teal
+actions.  Dusk uses layered graphite surfaces and sea-glass accents.
+Appearance selects Follow system, Pearl, or Dusk for this session.
+The numbered sidebar becomes horizontal navigation below 1000 pixels wide.
+Page content scrolls independently from the persistent save controls and
+Activity log.  Selected, hovered, focused, and disabled controls have distinct
+visual treatments; neutral status labels do not imply success.
 .SH OVERVIEW
-Overview provides service status, device discovery, and the Configuration
-file field.  Advanced connection settings contains the Daemon executable
-field and detected window system.  Custom configuration files are identified
-explicitly because the background service does not load them.  Controls are:
-.TP
-.B Reload from daemon
-Run wiilandd --dump-config and replace the form with the resolved values.
+Overview puts service status and device discovery first, with a short
+Connect / Configure / Test sequence.  Configuration file & advanced settings
+contains the editable configuration path, daemon executable, and detected
+window system.  Custom files are identified explicitly because the background
+service does not load them.
+Controls are:
 .TP
 .B Refresh
 Run
 .BR "systemctl --user is-active wiilandd.service" .
+.TP
+.B Refresh daemon status
+Query the daemon over IPC and show its running configuration and reactor
+timing/loss counters in the Activity log.
 .TP
 .B Start , Stop , Restart
 Run the corresponding
 .BR "systemctl --user"
 operation for
 .BR wiilandd.service .
+The primary service action is Start or Restart according to the queried state;
+the Service actions menu contains all three operations.
 .TP
 .B Check readiness
 Run
@@ -84,29 +92,36 @@ Unavailable.  Successful service changes trigger a fresh status query.
 Configure separates settings into four focused pages:
 .TP
 .B Profile & pointer
-Default profile (gamepad, desktop, or both), D-pad pointer speed, IR gain,
-IR jitter deadzone, IR smoothing, IR tracking (dual, centroid, or first), IR
-aim mapping (relative or absolute), and optional IR screen calibration bounds.
+Choose Gamepad, Desktop, or Both, then tune Pointer response: D-pad pointer
+speed, IR gain, IR jitter deadzone, and IR smoothing.  Advanced IR mapping &
+screen calibration expands to show IR tracking (dual, centroid, or first),
+IR aim mapping (relative or absolute), and optional screen calibration bounds.
 .TP
 .B Motion aiming
-Output (off, right stick, or mouse), sensor (automatic, IR, MotionPlus, or
-accelerometer), activation (always, B, Nunchuk Z, or Nunchuk C), sensitivity,
-deadzone, smoothing, X/Y inversion, independent accelerometer and MotionPlus
-calibration toggles and X/Y/Z fields, and calibration duration.
+Choose Off, Right stick, or Mouse pointer.  Response groups sensitivity,
+deadzone, smoothing, and X/Y inversion.  Sensor & activation groups the sensor
+(automatic, IR, MotionPlus, or accelerometer) and activation (always, B,
+Nunchuk Z, or Nunchuk C).  Saved sensor calibration expands to show independent
+accelerometer and MotionPlus calibration toggles and X/Y/Z fields, with
+calibration duration.
 .TP
 .B Button bindings
-Actions for Wii Remote A, B, +, -, Home, 1, and 2.  Each action is one of
-disabled, left-click, right-click, enter, escape, overview, page-up, or
-page-down.
+Desktop buttons assigns actions to Wii Remote A, B, +, -, Home, 1, and 2.
+Each action is one of disabled, left-click, right-click, enter, escape, overview,
+page-up, or page-down.  These mappings apply to Desktop and Both; Gamepad
+retains its standard button mapping.
 .TP
 .B Device rules
-Add or remove up to 32 ordered rules.  Each rule matches a substring of either
-the device path or device type and selects gamepad, desktop, or both.  Later
-matching rules override earlier matches.
+Controller rules supports up to 32 ordered rules.  Each rule matches a
+substring of either the device path or device type and selects Gamepad,
+Desktop, or Both.  Rules are evaluated from top to bottom; the last matching
+rule wins.  Move earlier lowers a rule's priority and Move later raises it;
+movement is disabled at the first and last boundaries respectively.
+Add rule appends a rule, and Remove deletes the selected rule.
 .PP
 Numeric widgets constrain values to the daemon's accepted ranges.  Changes are
 marked unsaved.  Validation errors appear above the save controls.  The save
-bar remains visible while scrolling and on other pages with unsaved edits.
+bar remains visible while scrolling and on every page, with or without edits.
 Its controls are:
 .TP
 .B Reload
@@ -147,23 +162,26 @@ independently, applied to the form, and marked unsaved. Device loss, interface
 changes, and queue overflow reject the capture.
 .TP
 .B Direct hardware diagnostics
-Use this explicit mode with the daemon stopped for standalone subprocess
-capture. Traces run with --dry-run and --no-ipc; temporary profiles apply only
-in this mode. Calibration uses --calibrate-aim.
+Expand Advanced capture options to enable this explicit mode with the daemon
+stopped for standalone subprocess capture.  Traces run with --dry-run and
+--no-ipc; temporary profiles apply only in this mode.
+Calibration uses --calibrate-aim.
 .PP
 Trace and calibration are mutually exclusive.  Capture selectors are locked
-while a capture is running.  Stop capture also remains available in the
-bottom status strip when a capture is active, including on other pages.
+while a capture is running.  Stop capture remains available in the bottom
+status strip when a capture is active, including on other pages.
 .PP
-Diagnostics & reference provides Check readiness (--doctor), Validate saved
-file (--check-config), Effective settings (--dump-config), Input map
-(--axis-map), and Test checklist (--validation-checklist).  These commands
-read saved configuration, not pending edits.  The daemon's test checklist
-covers controller families and desktop/game compatibility checks.
+The collapsed Saved-file diagnostics & reference section provides Check readiness
+(--doctor), Validate saved file (--check-config), Effective settings
+(--dump-config), Input map (--axis-map), and Test checklist
+(--validation-checklist).  These commands read saved configuration, not
+pending edits.  The daemon's test checklist covers controller families and
+desktop/game compatibility checks.
 .SH ACTIVITY LOG
 The resizable Activity log displays commands, stdout, stderr, and process
-errors.  It opens for explicit diagnostic commands, captures, and configuration
-failures.  The bottom status strip toggles it on any page.  Copy all copies
+errors, with wrapped text and vertical scrolling.  It opens for explicit
+diagnostic commands, captures, and configuration failures.  The bottom status
+strip's Activity log toggle includes the retained block count.  Copy all copies
 the complete retained text; Clear removes it; Hide log collapses the drawer.
 The buffer retains at most 10,000 text blocks.  Completion results that
 belong to an old form revision or target are discarded, and a failed save

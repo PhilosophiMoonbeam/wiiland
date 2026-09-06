@@ -1,5 +1,6 @@
 //! Exercise the real egui layout and input handling without a display server or hardware.
 use super::*;
+use wiiland_core::DeviceRuleKind;
 
 struct Harness {
     ctx: egui::Context,
@@ -106,12 +107,7 @@ fn save_actions_remain_visible_with_long_forms_and_open_log() {
             for section in ConfigSection::ALL {
                 h.app.config_section = section;
                 h.settle();
-                for text in [
-                    "Validate and save",
-                    "Save and restart",
-                    "Unsaved changes",
-                    "Reload",
-                ] {
+                for text in ["Validate and save", "Save and restart", "Reload"] {
                     assert_eq!(
                         h.texts(text).len(),
                         1,
@@ -147,7 +143,7 @@ fn each_button_binding_has_a_visible_label() {
 }
 
 #[test]
-fn second_rule_dropdown_edits_only_the_second_rule() {
+fn reordered_rule_dropdown_edits_only_the_moved_rule() {
     let mut h = Harness::new([1180.0, 1000.0]);
     h.app.tab = Tab::Configuration;
     h.app.config_section = ConfigSection::Rules;
@@ -164,10 +160,26 @@ fn second_rule_dropdown_edits_only_the_second_rule() {
         ),
     ];
     h.settle();
+    h.click("Move later", 0);
+    assert_eq!(h.app.model.config.device_rules[0].match_text, "second");
+    assert_eq!(h.app.model.config.device_rules[1].match_text, "first");
     h.click("Gamepad", 1);
     h.click("Desktop pointer", 0);
     assert_eq!(h.app.model.config.device_rules[0].profile, Profile::GAMEPAD);
     assert_eq!(h.app.model.config.device_rules[1].profile, Profile::DESKTOP);
+    assert!(h.app.model.dirty);
+}
+
+#[test]
+fn selecting_the_current_profile_keeps_the_form_clean() {
+    let mut h = Harness::new([760.0, 600.0]);
+    h.app.tab = Tab::Configuration;
+    h.app.model.config.profile = Profile::GAMEPAD;
+    h.settle();
+    h.click("Gamepad", 0);
+    assert!(!h.app.model.dirty);
+    h.click("Desktop", 0);
+    assert_eq!(h.app.model.config.profile, Profile::DESKTOP);
     assert!(h.app.model.dirty);
 }
 
@@ -189,17 +201,19 @@ fn reload_confirmation_preserves_edits_when_cancelled() {
 }
 
 #[test]
-fn invalid_rule_is_explained_and_cannot_be_saved() {
+fn invalid_rule_blocks_saving_and_shows_the_validation_error() {
     let mut h = Harness::new([760.0, 600.0]);
     h.app.tab = Tab::Configuration;
     h.app.config_section = ConfigSection::Rules;
     h.settle();
     h.click("Add rule", 0);
     assert!(h.app.model.dirty);
-    assert!(h.app.model.validate_form().is_err());
+    let error = h.app.model.validate_form().unwrap_err();
     h.click("Validate and save", 0);
     assert!(h.app.config_task.is_none());
-    assert!(h.output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text().starts_with("Before saving:"))));
+    assert!(h.output.shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Text(t) if t.galley.text().contains(&error)
+    )));
 }
 
 #[test]
@@ -207,7 +221,6 @@ fn compact_navigation_reaches_validation_and_opens_activity_log() {
     let mut h = Harness::new([760.0, 600.0]);
     h.click("Test & calibrate", 0);
     assert_eq!(h.app.tab, Tab::Validation);
-    assert_eq!(h.texts("Live input trace").len(), 1);
     assert_eq!(
         h.texts("Start trace").len(),
         1,
@@ -242,18 +255,37 @@ fn service_status_distinguishes_stopped_from_unavailable() {
 }
 
 #[test]
-fn capture_can_be_stopped_from_overview_with_log_hidden() {
-    let mut h = Harness::new([760.0, 600.0]);
-    h.app.validation_task = Some(ValidationTask {
-        kind: ValidationKind::Trace,
-        cancel_requested: false,
-        process: CaptureTask::Direct(ProcessTask::spawn("/bin/sleep", &["10".to_owned()])),
-        calibration: None,
-    });
-    h.settle();
-    h.click("Stop capture", 0);
-    assert!(h.app.validation_task.as_ref().unwrap().cancel_requested);
-    assert_eq!(h.app.status, "Stopping capture…");
+fn capture_cancellation_survives_navigation_and_long_output_in_compact_layout() {
+    for output_open in [false, true] {
+        let mut h = Harness::new([760.0, 600.0]);
+        h.app.model.dirty = true;
+        h.app.output_open = output_open;
+        h.app.status =
+            "Configuration operation failed: ".to_owned() + &"/very-long-path".repeat(300);
+        h.app
+            .model
+            .append_output(&"/unbroken-diagnostic-path".repeat(500));
+        h.app.validation_task = Some(ValidationTask {
+            kind: ValidationKind::Trace,
+            cancel_requested: false,
+            process: CaptureTask::Direct(ProcessTask::spawn("/bin/sleep", &["10".to_owned()])),
+            calibration: None,
+        });
+        for (label, tab) in [
+            ("Configure", Tab::Configuration),
+            ("Test & calibrate", Tab::Validation),
+            ("Overview", Tab::Overview),
+        ] {
+            h.settle();
+            h.click(label, 0);
+            assert_eq!(h.app.tab, tab);
+            assert_eq!(h.texts("Stop capture").len(), 1);
+            assert_eq!(h.texts("Validate and save").len(), 1);
+            assert_eq!(h.texts("Save and restart").len(), 1);
+        }
+        h.click("Stop capture", 0);
+        assert!(h.app.validation_task.as_ref().unwrap().cancel_requested);
+    }
 }
 
 #[test]
@@ -282,7 +314,6 @@ fn cancelled_calibration_releases_ownership_without_applying_values() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(h.app.validation_task.is_none());
-    assert_eq!(h.app.status, "Capture stopped");
     assert_eq!(h.app.model.config, before);
     assert!(!h.app.model.dirty);
     assert!(h.app.model.begin_calibration().is_some());

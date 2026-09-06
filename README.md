@@ -233,13 +233,14 @@ wiiland-config
 
 `wiiland-config` uses egui with native winit Wayland/X11 backends and application
 ID `io.github.philosophimoonbeam.wiiland-config`; no toolkit-specific platform
-override is required. The control center edits and validates configuration,
-manages the user service, and captures live input and calibration samples through
-the running daemon. Live capture keeps normal virtual input active; the explicit
-direct-hardware diagnostic mode requires stopping the service first.
-Its pearl and dusk themes carry the logo's sea-glass palette into focused settings
-pages, with persistent save controls and an expandable activity log. Appearance
-follows the system by default; you can also select either palette explicitly.
+override is required. Start in Overview to check the user service and discover
+controllers, then Configure their controls or Test & calibrate live input.
+Capture through the running daemon keeps normal virtual input active; advanced
+direct-hardware diagnostics require stopping the service first.
+The pearl and dusk palettes pair clear native controls with persistent save
+actions and an expandable activity log. Appearance follows the system by default;
+you can also select either palette explicitly. Capture cancellation stays
+available when you navigate away or open the log.
 
 <p align="center">
   <img src="res/wiiland-control-center.png" width="800" alt="WiiLand Control Center in the pearl theme, showing labelled desktop button bindings and persistent save controls">
@@ -260,6 +261,14 @@ Both frontend capture paths require daemon protocol 1.1 or newer; existing
 protocol 1.0 status and subscription clients remain supported.
 
 ## Configure
+
+The control center's Configure workspace separates profile and pointer tuning,
+motion aiming, desktop button bindings, and ordered device rules. Advanced
+calibration details are grouped away from everyday tuning. Device rules run from
+top to bottom: the last match wins, and Move earlier / Move later changes their
+priority. Save controls remain visible across pages; Ctrl+S validates and saves
+without restarting. Saving a custom configuration file never restarts the service
+or changes which file it loads.
 
 WiiLand loads configuration in this order:
 
