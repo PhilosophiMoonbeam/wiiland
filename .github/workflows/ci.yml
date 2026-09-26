@@ -460,24 +460,19 @@ jobs:
           }
           catch {
             # Do not print account names or SIDs in public CI logs.
-            $whoamiGroups = @(whoami /groups /fo csv /nh)
-            Write-Output "whoami group lines: $($whoamiGroups.Count), logon-SID pattern present: $([bool]($whoamiGroups -match 'S-1-5-5-\d+-\d+'))"
-            $groups = @($whoamiGroups | ConvertFrom-Csv -Header Name, Type, SID, Attributes)
-            $logonGroups = @($groups | Where-Object { $_.SID -match '^S-1-5-5-\d+-\d+$' })
-            Write-Output "Current token logon groups: $($logonGroups.Count)"
-            foreach ($group in $logonGroups) {
-              Write-Output "Current token logon attributes: $($group.Attributes)"
-            }
-            if ($logonGroups.Count -eq 1) {
-              $pipePath = "\\.\pipe\WiiLand.$($logonGroups[0].SID).daemon"
-              try {
-                $acl = Get-Acl -LiteralPath $pipePath -ErrorAction Stop
+            try {
+              $pipes = @(Get-ChildItem -LiteralPath '\\.\pipe\' -ErrorAction Stop |
+                Where-Object { $_.Name -match '^WiiLand\.S-1-5-5-\d+-\d+\.daemon$' })
+              Write-Output "Live WiiLand daemon pipe count: $($pipes.Count)"
+              if ($pipes.Count -eq 1) {
+                $pipeSid = [regex]::Match($pipes[0].Name, 'S-1-5-5-\d+-\d+').Value
+                $acl = Get-Acl -LiteralPath $pipes[0].FullName -ErrorAction Stop
                 foreach ($rule in $acl.Access) {
-                  Write-Output "Pipe ACE: type=$($rule.AccessControlType) mask=$($rule.FileSystemRights.value__) identity-string-matches-logon=$($rule.IdentityReference.Value -eq $logonGroups[0].SID)"
+                  Write-Output "Pipe ACE: type=$($rule.AccessControlType) mask=$($rule.FileSystemRights.value__) identity-string-matches-pipe-logon=$($rule.IdentityReference.Value -eq $pipeSid)"
                 }
-              } catch {
-                Write-Output "Pipe descriptor query unavailable: $($_.Exception.GetType().Name)"
               }
+            } catch {
+              Write-Output "Pipe descriptor query unavailable: $($_.Exception.GetType().Name)"
             }
             if ($daemonProcess) {
               $daemonProcess.Refresh()
