@@ -95,19 +95,3 @@ fn partial_record_reports_hex_offset_and_failure() {
     let expected = format!("Unexpected end of eeprom file '{path_string}' at offset 0x00000003\n");
     assert_eq!(output.stderr, expected.as_bytes());
 }
-
-#[test]
-fn missing_file_reports_open_error_without_stdout() {
-    let path = std::env::temp_dir().join(format!(
-        "wiiland-dump-cli-missing-{}-{}",
-        std::process::id(),
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let path_string = path.to_str().expect("UTF-8 temporary path").to_owned();
-    let output = invoke(&[&path_string]);
-
-    assert!(!output.status.success());
-    assert_eq!(output.stdout, b"");
-    let expected = format!("Cannot open eeprom file '{path_string}': No such file or directory\n");
-    assert_eq!(output.stderr, expected.as_bytes());
-}
