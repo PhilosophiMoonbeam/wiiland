@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;

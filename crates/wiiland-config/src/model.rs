@@ -173,9 +173,12 @@ pub struct ConfigModel {
 
 impl Default for ConfigModel {
     fn default() -> Self {
-        Self::new(
-            default_config_path().unwrap_or_else(|| PathBuf::from("/etc/wiiland/wiilandd.conf")),
-        )
+        #[cfg(windows)]
+        let path = default_config_path().unwrap_or_default();
+        #[cfg(not(windows))]
+        let path =
+            default_config_path().unwrap_or_else(|| PathBuf::from("/etc/wiiland/wiilandd.conf"));
+        Self::new(path)
     }
 }
 

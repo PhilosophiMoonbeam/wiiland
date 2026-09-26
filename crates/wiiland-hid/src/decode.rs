@@ -1,14 +1,18 @@
-//! Private evdev decoder and state machine implementation.
+//! Shared event types, MotionPlus normalization, and the private Linux evdev decoder.
 
+#[cfg(not(windows))]
+use crate::model::ButtonState;
+#[cfg(not(windows))]
 use crate::model::{
     ABS_HAT0X, ABS_HAT0Y, ABS_HAT1X, ABS_HAT1Y, ABS_HAT2X, ABS_HAT2Y, ABS_HAT3X, ABS_HAT3Y, ABS_RX,
-    ABS_RY, ABS_RZ, ABS_X, ABS_Y, Axis3, BTN_1, BTN_2, BTN_3, BTN_4, BTN_5, BTN_A, BTN_B, BTN_C,
+    ABS_RY, ABS_RZ, ABS_X, ABS_Y, BTN_1, BTN_2, BTN_3, BTN_4, BTN_5, BTN_A, BTN_B, BTN_C,
     BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, BTN_DPAD_UP, BTN_EAST, BTN_MODE, BTN_NORTH,
     BTN_SELECT, BTN_SOUTH, BTN_START, BTN_THUMBL, BTN_THUMBR, BTN_TL, BTN_TL2, BTN_TR, BTN_TR2,
-    BTN_WEST, BTN_X, BTN_Y, BTN_Z, Button, ButtonEvent, ButtonState, DRUM_SLOT_COUNT, EV_ABS,
-    EV_KEY, EV_SYN, InputEvent, KEY_DOWN, KEY_LEFT, KEY_NEXT, KEY_PREVIOUS, KEY_RIGHT, KEY_UP,
-    SYN_DROPPED, SYN_REPORT, Timestamp,
+    BTN_WEST, BTN_X, BTN_Y, BTN_Z, Button, DRUM_SLOT_COUNT, EV_ABS, EV_KEY, EV_SYN, InputEvent,
+    KEY_DOWN, KEY_LEFT, KEY_NEXT, KEY_PREVIOUS, KEY_RIGHT, KEY_UP, SYN_DROPPED, SYN_REPORT,
 };
+use crate::model::{Axis3, ButtonEvent, Timestamp};
+#[cfg(not(windows))]
 use libc::timeval;
 
 /// Typed event discriminant with an explicit future-value case.
@@ -35,6 +39,7 @@ pub enum EventType {
     Unknown(u32),
 }
 
+#[cfg(not(windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub(crate) enum InterfaceKind {
@@ -105,6 +110,7 @@ impl MotionPlusNormalizer {
             self.factor,
         )
     }
+    #[cfg(not(windows))]
     pub(crate) fn normalize(&mut self, value: Axis3) -> Axis3 {
         Axis3 {
             x: normalize_axis(value.x, &mut self.offsets.x, self.factor),
@@ -116,6 +122,7 @@ impl MotionPlusNormalizer {
 fn scale_offset(value: i32) -> i32 {
     (i64::from(value) * 100).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
+#[cfg(not(windows))]
 fn normalize_axis(value: i32, offset: &mut i32, factor: i32) -> i32 {
     let normalized = (i64::from(value) - i64::from(*offset) / 100)
         .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
@@ -130,8 +137,10 @@ fn normalize_axis(value: i32, offset: &mut i32, factor: i32) -> i32 {
     }
     normalized
 }
+#[cfg(not(windows))]
 const KEY_WORDS: usize = 12; // KEY_MAX is 0x2ff on Linux (768 bits).
 
+#[cfg(not(windows))]
 /// State needed to preserve deterministic `SYN_DROPPED` recovery ordering.
 #[derive(Clone, Debug)]
 pub(crate) struct RecoveryState {
@@ -143,6 +152,7 @@ pub(crate) struct RecoveryState {
     resync_time: timeval,
 }
 
+#[cfg(not(windows))]
 impl Default for RecoveryState {
     fn default() -> Self {
         Self {
@@ -158,6 +168,7 @@ impl Default for RecoveryState {
         }
     }
 }
+#[cfg(not(windows))]
 impl RecoveryState {
     pub(crate) fn dropped(&mut self) {
         self.desynced = true;
@@ -246,6 +257,7 @@ impl RecoveryState {
     }
 }
 
+#[cfg(not(windows))]
 #[derive(Clone, Debug)]
 pub(crate) struct CacheState {
     pub(crate) accel: Axis3,
@@ -258,6 +270,7 @@ pub(crate) struct CacheState {
     pub(crate) drums: [Axis3; DRUM_SLOT_COUNT],
     pub(crate) guitar: [Axis3; 3],
 }
+#[cfg(not(windows))]
 impl Default for CacheState {
     fn default() -> Self {
         let mut ir = [Axis3::default(); 4];
@@ -279,12 +292,14 @@ impl Default for CacheState {
     }
 }
 
+#[cfg(not(windows))]
 pub(crate) struct Decoder {
     pub(crate) interface: InterfaceKind,
     pub(crate) cache: CacheState,
     pub(crate) recovery: RecoveryState,
     pub(crate) motion_plus: MotionPlusNormalizer,
 }
+#[cfg(not(windows))]
 impl Decoder {
     pub(crate) fn new(interface: InterfaceKind) -> Self {
         Self {
@@ -492,6 +507,7 @@ impl Decoder {
     }
 }
 
+#[cfg(not(windows))]
 pub(crate) fn abs_codes(interface: InterfaceKind) -> &'static [u16] {
     match interface {
         InterfaceKind::Accel | InterfaceKind::MotionPlus => &[ABS_RX, ABS_RY, ABS_RZ],
@@ -513,6 +529,7 @@ pub(crate) fn abs_codes(interface: InterfaceKind) -> &'static [u16] {
     }
 }
 
+#[cfg(not(windows))]
 fn map_core_key(c: u16) -> Option<Button> {
     Some(match c {
         KEY_LEFT => Button::Left,
@@ -529,6 +546,7 @@ fn map_core_key(c: u16) -> Option<Button> {
         _ => return None,
     })
 }
+#[cfg(not(windows))]
 fn map_nunchuk_key(c: u16) -> Option<Button> {
     Some(match c {
         BTN_C => Button::C,
@@ -536,6 +554,7 @@ fn map_nunchuk_key(c: u16) -> Option<Button> {
         _ => return None,
     })
 }
+#[cfg(not(windows))]
 fn map_classic_key(c: u16) -> Option<Button> {
     Some(match c {
         BTN_A => Button::A,
@@ -556,6 +575,7 @@ fn map_classic_key(c: u16) -> Option<Button> {
         _ => return None,
     })
 }
+#[cfg(not(windows))]
 fn map_pro_key(c: u16) -> Option<Button> {
     Some(match c {
         BTN_EAST => Button::A,
@@ -578,6 +598,7 @@ fn map_pro_key(c: u16) -> Option<Button> {
         _ => return None,
     })
 }
+#[cfg(not(windows))]
 fn map_drums_key(c: u16) -> Option<Button> {
     Some(match c {
         BTN_START => Button::Plus,
@@ -585,6 +606,7 @@ fn map_drums_key(c: u16) -> Option<Button> {
         _ => return None,
     })
 }
+#[cfg(not(windows))]
 fn map_guitar_key(c: u16) -> Option<Button> {
     Some(match c {
         BTN_1 => Button::FretFarUp,

@@ -4,9 +4,15 @@ WIILANDD DAEMON IPC PROTOCOL
 Status: private protocol, version 1.1
 
 This document is the language-neutral wire specification for the private IPC
-socket exposed by wiilandd.  The protocol version is independent of the Cargo
-package version.  The Rust types in crates/wiiland-ipc/src/protocol.rs are the
-authoritative implementation of the JSON shapes described here.
+transport exposed by wiilandd.  The JSON application protocol version is
+independent of the Cargo package version.  The Rust types in
+crates/wiiland-ipc/src/protocol.rs are the authoritative implementation of the
+JSON shapes described here.
+
+The JSON protocol is shared across platforms.  The Unix socket transport
+described below applies on Unix; Windows first performs the named-pipe
+bootstrap in section 1A, then carries the same JSON protocol over its return
+pipe.
 
 The protocol is intentionally a private daemon integration boundary.  It is
 not a C ABI, installed library interface, or promise about Rust object layout.
@@ -15,11 +21,13 @@ There is no standalone installed client and no socket activation interface.
 1. TRANSPORT AND FRAMING
 ------------------------
 
-The transport is a private per-user Unix stream socket (AF_UNIX, SOCK_STREAM).
-Each frame is one UTF-8 JSON object followed by LF (0x0a).  A receiver may
-accept CRLF as a convenience; wiilandd emits LF.  Frames are not length
-prefixed and stream reads are not frame boundaries: buffer bytes until LF and
-then decode the complete payload.
+On Unix platforms, the transport is a private per-user Unix stream socket
+(AF_UNIX, SOCK_STREAM).
+
+For application JSON on either platform, each frame is one UTF-8 JSON object
+followed by LF (0x0a).  A receiver may accept CRLF as a convenience; wiilandd
+emits LF.  Frames are not length prefixed and stream reads are not frame
+boundaries: buffer bytes until LF and then decode the complete payload.
 
 The maximum frame payload is 65,536 bytes, excluding LF (or CRLF).  A payload
 of exactly 65,536 bytes is valid; a larger payload is not.  This bound applies
@@ -38,6 +46,71 @@ of at most 8 reads and 8 processed frames.  At most 65,536 output bytes are
 written for any one client in the iteration.  A client's queued output is
 limited to 262,144 bytes.  A client that is too slow to stay within that limit
 is disconnected; this does not stop HID processing or other clients.
+
+1A. WINDOWS NAMED-PIPE BOOTSTRAP
+--------------------------------
+
+Windows does not send application JSON on the rendezvous pipe.  The daemon
+keeps one single-instance rendezvous endpoint open at:
+
+    \\.\pipe\WiiLand.<logon SID>.daemon
+
+For each connection attempt, the client creates and keeps open a separate
+single-instance return pipe at:
+
+    \\.\pipe\WiiLand.<logon SID>.return.<32 lowercase hex chars>
+
+The 32 hex characters encode a fresh 16-byte ReturnPipeId.  The identifier is
+random routing material, not a secret or an authentication credential.  The
+return-pipe name is derived from the client's logon SID and identifier, not
+accepted as an arbitrary path.  The server retains its rendezvous instance and
+reuses it after each attempt; application JSON travels only on the connection's
+return pipe.
+
+Bootstrap records are fixed-size binary records, not JSON or LF-delimited
+frames.  The transport version is 1, independent of JSON IPC version 1.1.
+Every u32 is little-endian.  Exactly one version-1 record of the expected type
+and size is accepted at each position; unsupported versions, malformed or
+truncated records, and out-of-order records fail the attempt.
+
+    ClientAnnounce: u32 version + 16-byte ReturnPipeId  (20 bytes, rendezvous)
+    DaemonHello:    u32 version + 16-byte challenge     (20 bytes, return)
+    ClientEcho:     u32 version + same challenge        (20 bytes, rendezvous)
+    DaemonReady:    u32 version + u32 status            (8 bytes, return)
+
+The client creates the return pipe, connects to the rendezvous, and sends
+ClientAnnounce.  The daemon authenticates that rendezvous-pipe writer before
+using the announcement, connects to the named return pipe, and sends
+DaemonHello with a fresh 16-byte operating-system-random challenge.  The
+client authenticates the return-pipe writer before accepting the challenge,
+then echoes it on the still-open rendezvous connection.  The daemon accepts
+only the matching echo from that same rendezvous connection and sends
+DaemonReady on the return pipe.  Status zero is the only success status;
+nonzero or invalid readiness fails the attempt and carries no application
+error detail.  Neither side may send or accept application JSON before
+successful readiness.  A previous attempt's echo cannot complete a new
+attempt.
+
+These records do not authenticate a peer merely by being well-formed.  At both
+authentication points, the receiver impersonates the actual connected pipe
+writer and opens its thread token with OpenThreadToken(TOKEN_QUERY,
+OpenAsSelf=TRUE).  It compares both TokenUser and TokenLogonSid exactly with its
+own corresponding values; missing or unavailable identity data denies the
+connection.  RevertToSelf is checked and a failure to revert is fatal.  Pipe
+opens request Identification-level SQOS; the bootstrap uses the token only to
+query identity.
+
+The whole rendezvous/return-pipe attempt has one absolute two-second deadline
+from the start of the attempt, not a fresh timeout for each record or pipe
+operation.  Incomplete or invalid attempts are aborted; pending I/O is
+canceled and drained before its state or handles are released.  Handshake I/O
+is overlapped and must not block the reactor or stall established clients.
+Application JSON framing, Hello negotiation, and version 1.1 messages are
+unchanged; admitted clients continue to use the shared IOCP, with capacity for
+up to 64 application clients.
+
+See `doc/WINDOWS.md` for the Windows pipe ACL, endpoint-availability, and
+same-logon trust boundary.
 
 2. SOCKET PATH, PERMISSIONS, AND LIFECYCLE
 ------------------------------------------
@@ -87,6 +160,7 @@ lock file is synchronization state, not a persistent socket.
 The pathname and permissions are access control; the protocol has no
 additional authentication or encryption layer.  Keep the parent directory
 private and do not place this socket in a shared directory.
+
 
 3. JSON CONVENTIONS
 -------------------

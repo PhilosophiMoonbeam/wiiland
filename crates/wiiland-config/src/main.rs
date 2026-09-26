@@ -79,7 +79,14 @@ fn write_smoke_report() -> std::io::Result<()> {
         .expect("smoke save transaction");
     model.config.pointer_speed = 18;
     model.mark_dirty();
-    let save_task = config_task::ConfigTask::spawn(save, "/bin/true".to_owned(), None);
+    #[cfg(windows)]
+    let smoke_daemon = live::trusted_daemon_path()
+        .map_err(std::io::Error::other)?
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(windows))]
+    let smoke_daemon = "/bin/true".to_owned();
+    let save_task = config_task::ConfigTask::spawn(save, smoke_daemon, None);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let save_completion = loop {
         match save_task.try_recv() {

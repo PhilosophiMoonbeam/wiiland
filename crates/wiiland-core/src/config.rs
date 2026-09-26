@@ -9,11 +9,39 @@ pub const MAX_LINE_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
+    Auto,
     Uinput,
+    WindowsVhf,
 }
 impl Backend {
     pub fn as_str(self) -> &'static str {
-        "uinput"
+        match self {
+            Self::Auto => "auto",
+            Self::Uinput => "uinput",
+            Self::WindowsVhf => "windows-vhf",
+        }
+    }
+
+    pub fn resolve_for_current_platform(self) -> Result<Self, &'static str> {
+        #[cfg(target_os = "linux")]
+        {
+            match self {
+                Self::Auto | Self::Uinput => Ok(Self::Uinput),
+                Self::WindowsVhf => Err("backend windows-vhf is not supported on Linux"),
+            }
+        }
+        #[cfg(windows)]
+        {
+            match self {
+                Self::Auto | Self::WindowsVhf => Ok(Self::WindowsVhf),
+                Self::Uinput => Err("backend uinput is not supported on Windows"),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = self;
+            Err("no output backend is supported on this target")
+        }
     }
 }
 
@@ -345,7 +373,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
             backend: Backend::Uinput,
+            #[cfg(not(target_os = "linux"))]
+            backend: Backend::Auto,
             profile: Profile::GAMEPAD,
             pointer_speed: 16,
             ir_speed: 8,
@@ -544,12 +575,13 @@ impl Config {
         }
         match key {
             "backend" => {
-                if value == "uinput" {
-                    self.backend = Backend::Uinput;
-                    Ok(())
-                } else {
-                    Err(Self::invalid(path, line, key))
-                }
+                self.backend = match value {
+                    "auto" => Backend::Auto,
+                    "uinput" => Backend::Uinput,
+                    "windows-vhf" => Backend::WindowsVhf,
+                    _ => return Err(Self::invalid(path, line, key)),
+                };
+                Ok(())
             }
             "profile" => {
                 self.profile =

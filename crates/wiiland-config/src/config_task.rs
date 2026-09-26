@@ -169,8 +169,9 @@ fn run(
     check_cancelled(stop)?;
     match temporary {
         Some(temporary) => {
-            // Rename the same immutable snapshot that was validated. Neither a
-            // later form edit nor a target change can alter this operation.
+            // The temporary was created beside the target; persist atomically
+            // replaces an existing config without crossing volumes on Windows.
+            // It also installs the exact snapshot used for validation.
             temporary
                 .persist(&transaction.target)
                 .map_err(|error| failure(ConfigFailureStage::Persistence, error.error))?;
@@ -227,7 +228,7 @@ fn run_process(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

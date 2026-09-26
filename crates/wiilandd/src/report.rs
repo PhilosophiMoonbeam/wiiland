@@ -6,15 +6,27 @@
 
 use std::env;
 use std::fmt::Write as _;
+#[cfg(not(windows))]
 use std::fs::{self, OpenOptions};
+#[cfg(not(windows))]
 use std::io::{self, Read, Write};
+#[cfg(not(windows))]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(not(windows))]
 use std::os::unix::process::CommandExt;
+#[cfg(not(windows))]
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
+#[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(windows))]
 const USAGE: &str = "Usage:\n  wiilandd-hardware-report\n  wiilandd-hardware-report <number-or-/sys/path> [extra wiilandd args]\n\nCollect finite WiiLand host, permission, config, doctor, axis-map, device, and\nmanual Wayland/X.org validation diagnostics. With a device argument, continue\ninto live dry-run trace capture and pass non-conflicting arguments to wiilandd.";
+
+#[cfg(windows)]
+const USAGE: &str = "Usage:\n  wiilandd-hardware-report\n  wiilandd-hardware-report <number-or-HID-identity> [extra wiilandd args]\n\nCollect Windows configuration, backend, HID device, and runtime dependency\ndiagnostics. With a device selector, request live dry-run trace capture from\nwiilandd using an ordinal or opaque Windows HID identity.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedArgs {
@@ -104,9 +116,14 @@ fn is_conflicting(arg: &str) -> bool {
             | "--validation-checklist"
             | "--doctor"
             | "--dump-config"
+            | "--pair"
+            | "--radio"
+            | "--pairing-method"
     ) || arg.starts_with("--device=")
         || arg.starts_with("--profile=")
         || arg.starts_with("--dry-run=")
+        || arg.starts_with("--radio=")
+        || arg.starts_with("--pairing-method=")
 }
 
 fn consumes_value(arg: &str) -> bool {
@@ -129,9 +146,12 @@ fn consumes_value(arg: &str) -> bool {
             | "--aim-invert-x"
             | "--aim-invert-y"
             | "--aim-calibration-duration"
+            | "--radio"
+            | "--pairing-method"
     )
 }
 
+#[cfg(not(windows))]
 #[derive(Debug, Clone)]
 pub struct ReportEnvironment {
     pub wiilandd: String,
@@ -141,6 +161,7 @@ pub struct ReportEnvironment {
     pub tmp_dir: PathBuf,
 }
 
+#[cfg(not(windows))]
 impl ReportEnvironment {
     pub fn from_env() -> Self {
         let repo_dir = env::var_os("WIILAND_REPO_DIR")
@@ -162,7 +183,9 @@ impl ReportEnvironment {
     }
 }
 
+#[cfg(not(windows))]
 struct TempDir(PathBuf);
+#[cfg(not(windows))]
 impl TempDir {
     fn create(parent: &Path) -> io::Result<Self> {
         fs::create_dir_all(parent)?;
@@ -184,12 +207,14 @@ impl TempDir {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+#[cfg(not(windows))]
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(not(windows))]
 fn command_available(program: &str) -> bool {
     let path = Path::new(program);
     if path.components().count() > 1 {
@@ -208,12 +233,14 @@ fn command_available(program: &str) -> bool {
     })
 }
 
+#[cfg(not(windows))]
 fn command(program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(program);
     command.args(args);
     command
 }
 
+#[cfg(not(windows))]
 fn display_command(out: &mut String, prefix: &str, program: &str, args: &[String]) {
     let _ = write!(out, "{prefix} {program}");
     for arg in args {
@@ -222,6 +249,7 @@ fn display_command(out: &mut String, prefix: &str, program: &str, args: &[String
     out.push('\n');
 }
 
+#[cfg(not(windows))]
 fn run_optional(out: &mut String, program: &str, args: &[&str]) {
     let mut shown = vec![program.to_owned()];
     shown.extend(args.iter().map(|a| (*a).to_owned()));
@@ -241,6 +269,7 @@ fn run_optional(out: &mut String, program: &str, args: &[&str]) {
     }
 }
 
+#[cfg(not(windows))]
 fn run_probe(out: &mut String, program: &str, args: &[String]) -> bool {
     display_command(out, "$", program, args);
     let mut c = Command::new(program);
@@ -257,6 +286,7 @@ fn run_probe(out: &mut String, program: &str, args: &[String]) -> bool {
     ok
 }
 
+#[cfg(not(windows))]
 fn run_required(
     out: &mut String,
     failures: &mut usize,
@@ -270,6 +300,7 @@ fn run_required(
     }
 }
 
+#[cfg(not(windows))]
 fn read_attr(path: &Path, attr: &str) -> String {
     let mut value = String::new();
     match fs::File::open(path.join(attr)).and_then(|mut f| f.read_to_string(&mut value)) {
@@ -278,6 +309,7 @@ fn read_attr(path: &Path, attr: &str) -> String {
     }
 }
 
+#[cfg(not(windows))]
 fn battery(path: &Path) -> String {
     let Ok(entries) = fs::read_dir(path.join("power_supply")) else {
         return "unavailable".to_owned();
@@ -299,6 +331,7 @@ fn battery(path: &Path) -> String {
     "unavailable".to_owned()
 }
 
+#[cfg(not(windows))]
 fn path_access(out: &mut String, label: &str, path: &Path) {
     let exists = path.exists();
     let _ = writeln!(out, "{label}.exists={}", if exists { "yes" } else { "no" });
@@ -334,6 +367,7 @@ fn path_access(out: &mut String, label: &str, path: &Path) {
     }
 }
 
+#[cfg(not(windows))]
 fn report_event_nodes(out: &mut String, index: &str, syspath: &Path) {
     let Ok(inputs) = fs::read_dir(syspath.join("input")) else {
         return;
@@ -375,6 +409,7 @@ fn report_event_nodes(out: &mut String, index: &str, syspath: &Path) {
     }
 }
 
+#[cfg(not(windows))]
 fn report_device_uevent(out: &mut String, index: &str, syspath: &Path) {
     let Ok(contents) = fs::read_to_string(syspath.join("uevent")) else {
         let _ = writeln!(out, "device.{index}.uevent=unavailable");
@@ -396,6 +431,7 @@ fn report_device_uevent(out: &mut String, index: &str, syspath: &Path) {
     }
 }
 
+#[cfg(not(windows))]
 fn report_device_attrs(out: &mut String, failures: &mut usize, contents: &str) {
     for (line_number, line) in contents.lines().enumerate() {
         let row = line_number + 1;
@@ -446,6 +482,7 @@ fn report_device_attrs(out: &mut String, failures: &mut usize, contents: &str) {
     }
 }
 
+#[cfg(not(windows))]
 fn report_os_release(out: &mut String, path: &Path) {
     let Ok(contents) = fs::read_to_string(path) else {
         let _ = writeln!(out, "os-release=unavailable");
@@ -468,6 +505,7 @@ fn report_os_release(out: &mut String, path: &Path) {
     }
 }
 
+#[cfg(not(windows))]
 fn report_module_parameters(out: &mut String, module_dir: &Path) {
     let parameters = module_dir.join("parameters");
     let Ok(entries) = fs::read_dir(&parameters) else {
@@ -493,6 +531,7 @@ fn report_module_parameters(out: &mut String, module_dir: &Path) {
     }
 }
 
+#[cfg(not(windows))]
 fn report_git(out: &mut String, repo: &Path) {
     if !command_available("git") {
         let _ = writeln!(out, "git.commit=unavailable\ngit.dirty=unavailable");
@@ -533,6 +572,7 @@ fn report_git(out: &mut String, repo: &Path) {
     let _ = writeln!(out, "git.dirty={dirty}");
 }
 
+#[cfg(not(windows))]
 fn append_optional_output(out: &mut String, shown: &str, output: &std::process::Output) -> bool {
     out.push_str(&String::from_utf8_lossy(&output.stdout));
     if output.status.success() {
@@ -543,6 +583,7 @@ fn append_optional_output(out: &mut String, shown: &str, output: &std::process::
     }
 }
 
+#[cfg(not(windows))]
 fn bluetooth(out: &mut String) {
     if !command_available("bluetoothctl") {
         let _ = writeln!(out, "optional.bluetoothctl.controllers=unavailable");
@@ -583,6 +624,7 @@ fn bluetooth(out: &mut String) {
     }
 }
 
+#[cfg(not(windows))]
 fn timestamp() -> String {
     // UTC calendar conversion from Unix seconds, avoiding a locale-dependent subprocess.
     let seconds = SystemTime::now()
@@ -599,6 +641,7 @@ fn timestamp() -> String {
         rem % 60
     )
 }
+#[cfg(not(windows))]
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -612,6 +655,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
+#[cfg(not(windows))]
 fn manual(out: &mut String) {
     out.push_str("\n== manual-validation ==\n");
     out.push_str("manual.sdl=TODO: validate virtual gamepad in an SDL input tester\n");
@@ -637,6 +681,7 @@ pub fn usage() -> &'static str {
 /// Run the finite report. The returned value is the process exit status. When a device
 /// is selected, successful report collection ends by replacing this process with the
 /// daemon, preserving its PID, signals, and final status.
+#[cfg(not(windows))]
 pub fn run() -> i32 {
     let raw: Vec<String> = env::args().skip(1).collect();
     if raw.first().is_some_and(|a| a == "-h" || a == "--help") {
@@ -830,6 +875,173 @@ pub fn run() -> i32 {
     1
 }
 
+#[cfg(windows)]
+fn run_windows_command(
+    out: &mut String,
+    executable: &str,
+    args: &[&str],
+    required: bool,
+    failures: &mut usize,
+    name: &str,
+) {
+    let _ = write!(out, "$ {executable}");
+    for arg in args {
+        let _ = write!(out, " {arg}");
+    }
+    out.push('\n');
+    match Command::new(executable).args(args).output() {
+        Ok(output) => {
+            out.push_str(&String::from_utf8_lossy(&output.stdout));
+            out.push_str(&String::from_utf8_lossy(&output.stderr));
+            if !output.status.success() {
+                let _ = writeln!(
+                    out,
+                    "failed: {executable} {} (status {})",
+                    args.join(" "),
+                    output.status
+                );
+                if required {
+                    *failures += 1;
+                    let _ = writeln!(out, "core.failure.{failures}=wiilandd.{name}");
+                }
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(out, "failed: {executable}: {error}");
+            if required {
+                *failures += 1;
+                let _ = writeln!(out, "core.failure.{failures}=wiilandd.{name}");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn run() -> i32 {
+    let raw: Vec<String> = env::args().skip(1).collect();
+    if raw
+        .first()
+        .is_some_and(|arg| arg == "-h" || arg == "--help")
+    {
+        println!("{USAGE}");
+        return 0;
+    }
+    let parsed = match parse_args(&raw) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("wiilandd-hardware-report: {error}");
+            eprintln!("{USAGE}");
+            return 2;
+        }
+    };
+    let executable = env::var("WIILANDD").unwrap_or_else(|_| "wiilandd.exe".to_owned());
+    let mut out = String::from(
+        "\n== Windows runtime ==\nreport.schema.version=2\nruntime.output.service=wiiland-output-service\nruntime.output.driver=wiiland-vhid\nruntime.output.installation=not-probed\nruntime.output.probe=not-performed-by-report\n",
+    );
+    let mut failures = 0;
+    run_windows_command(
+        &mut out,
+        &executable,
+        &["--version"],
+        false,
+        &mut failures,
+        "version",
+    );
+    run_windows_command(
+        &mut out,
+        &executable,
+        &["--check-config"],
+        true,
+        &mut failures,
+        "check-config",
+    );
+    run_windows_command(
+        &mut out,
+        &executable,
+        &["--dump-config"],
+        false,
+        &mut failures,
+        "dump-config",
+    );
+    run_windows_command(
+        &mut out,
+        &executable,
+        &["--axis-map"],
+        false,
+        &mut failures,
+        "axis-map",
+    );
+    run_windows_command(
+        &mut out,
+        &executable,
+        &["--validation-checklist"],
+        false,
+        &mut failures,
+        "validation-checklist",
+    );
+    run_windows_command(
+        &mut out,
+        &executable,
+        &["--doctor"],
+        true,
+        &mut failures,
+        "doctor",
+    );
+    run_windows_command(
+        &mut out,
+        &executable,
+        &["--list"],
+        true,
+        &mut failures,
+        "list",
+    );
+
+    if let Some(device) = parsed.device.as_deref() {
+        let _ = writeln!(
+            out,
+            "\n== trace ==\nTracing Windows HID selector {device}; stop with Ctrl-C."
+        );
+        let mut args = vec!["--dry-run".to_owned()];
+        if parsed.trace_selectors == 0 {
+            args.push("--trace-events".to_owned());
+        }
+        args.extend([
+            "--verbose".to_owned(),
+            "--device".to_owned(),
+            device.to_owned(),
+            "--profile".to_owned(),
+            "both".to_owned(),
+        ]);
+        args.extend(parsed.extra);
+        let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_windows_command(
+            &mut out,
+            &executable,
+            &borrowed,
+            true,
+            &mut failures,
+            "trace",
+        );
+    } else {
+        out.push_str(
+            "\nPass a device ordinal or opaque HID identity to capture live dry-run traces:\n",
+        );
+        let _ = writeln!(
+            out,
+            "  WIILANDD={executable} wiilandd-hardware-report <number-or-HID-identity> [extra wiilandd args]"
+        );
+    }
+    let _ = writeln!(out, "\nreport.core-failures={failures}");
+    if failures == 0 {
+        out.push_str("report.status=ok\n");
+        print!("{out}");
+        0
+    } else {
+        out.push_str("report.status=failed\n");
+        print!("{out}");
+        1
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,7 +1061,15 @@ mod tests {
     }
     #[test]
     fn scanner_rejects_conflicts_and_multiple_selectors() {
-        for alias in ["-p", "--profile", "-n", "--dry-run"] {
+        for alias in [
+            "-p",
+            "--profile",
+            "-n",
+            "--dry-run",
+            "--pair",
+            "--radio",
+            "--pairing-method",
+        ] {
             let args = vec!["7".into(), alias.into()];
             assert_eq!(
                 parse_args(&args),
@@ -870,6 +1090,7 @@ mod tests {
         assert_eq!(parse_args(&args), Err(ArgError::MultipleTraceSelectors));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn captured_optional_output_stays_in_schema_order() {
         use std::os::unix::process::ExitStatusExt;

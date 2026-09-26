@@ -36,6 +36,50 @@ Wii hardware → hid-wiimote → wiiland-hid
 | **Frontends** | `wiiland-config` (eframe/egui, Wayland/X11), `wiiland-show` (ratatui/crossterm) |
 | **Driver path** | Linux `hid-wiimote` → Rust `wiiland-hid` → direct app or `wiilandd` |
 
+## Windows status
+
+Windows support is under development and is **not release-ready or supported**.
+The v3 privileged broker speaks protocol 3 over
+`\\.\pipe\WiiLandOutput.v3`; the VHF driver ABI and report layout remain
+version 2. It exposes only generic-HID gamepad and supplemental axes (report
+IDs 1 and 2), with no VHF keyboard or mouse collection. The broker allows up to
+32 simultaneous pipe connections and 32 global gamepad leases; a connection
+may own multiple leases. `wiilandd` queues full Gamepad and supplemental
+axes reports every 250 ms on a per-device output worker. Queueing or a stalled
+broker can delay publication; each report ID on each lease has an independent
+2000 ms deadline, after which the broker closes that connection and releases
+its leases. Heartbeats and the 2000 ms idle timeout do not refresh report
+deadlines.
+
+Lock, logoff, console disconnect, session change, or suspend/resume revokes all
+clients and leases from the prior session epoch. The service retains its pipe
+server instances across client and session transitions, including when no
+console session is authorized; it retains the pipe namespace, not gamepad
+identities. Revoked leases destroy their VHF children, with no identity
+continuity promised. Same-logon processes can exhaust the connection and lease
+limits, and a local process can squat on the pipe name before the service
+starts. Timely broker publication does not prove fresh physical controller
+input: the daemon can keep publishing cached input state.
+Desktop keyboard and relative mouse actions use the per-user daemon's
+`SendInput` path, which is restricted to a non-elevated, non-UIAccess
+interactive process and remains subject to UIPI.
+
+The checked-in virtual HID driver still uses the prototype identity `VID 0xFFFF,
+PID 0x0001`; no production package may ship with that unassigned identity, and
+the repository does not contain a trusted production-signed `.sys`/`.cat`
+release bundle or Windows 10/11 end-to-end hardware validation. The installer
+requires v3 broker metadata with protocol 3 and pipe `.v3`, while preserving
+driver ABI/report layout version 2; it also requires a non-prototype VID/PID
+approval reference and a trusted signed driver package.
+
+Windows 10 22H2 (build 19045) is the declared driver minimum, but remains
+unvalidated in this branch; the technical target also includes Windows 11.
+The virtual controller is standard generic HID, **not XInput**; applications
+that require Xbox/XInput devices are not guaranteed to recognize it. WiiLand
+does not yet provide a supported Windows pairing workflow, control-center UI,
+or complete Windows CLI/diagnostics. See [`doc/WINDOWS.md`](doc/WINDOWS.md) for
+the exact scope and release gate.
+
 ## Rust integration paths
 
 Choose one of these source-level Cargo integrations. A process either owns the
@@ -398,6 +442,7 @@ device type, session, and consumer results.
 - [`doc/wiiland.7`](doc/wiiland.7) — installed overview
 - [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) — processing boundaries, capture leases, and IPC 1.1
 - [`doc/DEVICES`](doc/DEVICES) and [`doc/PROTOCOL`](doc/PROTOCOL) — hardware model and archival protocol notes
+- [`doc/WINDOWS.md`](doc/WINDOWS.md) — Windows development scope and packaging gates
 - [`DEV`](DEV) — contributor build and packaging notes
 
 Questions, bugs, and hardware reports belong in the

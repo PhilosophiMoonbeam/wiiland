@@ -10,3 +10,6 @@ name = "wiiland_core"
 path = "src/lib.rs"
 
 [dependencies]
+
+[target.'cfg(windows)'.dependencies]
+known-folders = "1.4.2"

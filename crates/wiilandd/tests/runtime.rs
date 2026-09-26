@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use wiilandd::signal::SignalPipe;
 use wiilandd::uinput::{RecordingBackend, RecordingOp, VirtualDevice, VirtualKind};
 

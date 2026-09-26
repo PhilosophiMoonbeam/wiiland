@@ -1,15 +1,29 @@
+#[cfg(unix)]
 use std::env;
+#[cfg(unix)]
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 const ROOT: &str = "wiiland-2";
+#[cfg(unix)]
 const DIRECTORY_MODE: u32 = 0o755;
+#[cfg(unix)]
 const SOURCE_DIRS: &[&str] = &[".cargo", ".github", ".omp", "crates", "doc", "res", "xtask"];
+#[cfg(unix)]
 const SOURCE_FILES: &[&str] = &[
     ".gitignore",
     "Cargo.lock",
@@ -21,6 +35,7 @@ const SOURCE_FILES: &[&str] = &[
     "rust-toolchain.toml",
 ];
 
+#[cfg(unix)]
 fn collect(
     source: &Path,
     relative: &Path,
@@ -70,6 +85,7 @@ fn collect(
     Ok(())
 }
 
+#[cfg(unix)]
 fn collect_sources(source: &Path, excluded: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for &directory in SOURCE_DIRS {
@@ -89,6 +105,7 @@ fn collect_sources(source: &Path, excluded: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[cfg(unix)]
 fn copy_entry(source: &Path, dest: &Path, relative: &Path) -> io::Result<()> {
     let from = source.join(relative);
     let to = dest.join(relative);
@@ -112,6 +129,7 @@ fn copy_entry(source: &Path, dest: &Path, relative: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn normalize_directory_modes(root: &Path) -> io::Result<()> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -126,6 +144,7 @@ fn normalize_directory_modes(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn verification_script() -> &'static [u8] {
     br##"#!/bin/sh
 set -eu
@@ -141,6 +160,7 @@ exit 127
 "##
 }
 
+#[cfg(unix)]
 fn unique_temp(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -149,7 +169,8 @@ fn unique_temp(prefix: &str) -> PathBuf {
     env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
-pub fn dist(root: &Path, output: &Path) -> io::Result<()> {
+#[cfg(unix)]
+fn dist_unix(root: &Path, output: &Path) -> io::Result<()> {
     let source = fs::canonicalize(root)?;
     let output = if output.is_absolute() {
         output.to_path_buf()
@@ -220,7 +241,27 @@ pub fn dist(root: &Path, output: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
+pub fn dist(root: &Path, output: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        dist_unix(root, output)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, output);
+        Err(unsupported_unix_packaging())
+    }
+}
 
+#[cfg(not(unix))]
+fn unsupported_unix_packaging() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix distribution and verification are unsupported on this platform; use packaging/windows for the Windows installer",
+    )
+}
+
+#[cfg(unix)]
 fn list_archive(archive: &Path) -> io::Result<Vec<String>> {
     let output = Command::new("tar").args(["-tJf"]).arg(archive).output()?;
     if !output.status.success() {
@@ -234,6 +275,7 @@ fn list_archive(archive: &Path) -> io::Result<Vec<String>> {
     Ok(text.lines().map(str::to_owned).collect())
 }
 
+#[cfg(unix)]
 fn validate_names(names: &[String]) -> io::Result<()> {
     let mut roots = std::collections::BTreeSet::new();
     for name in names {
@@ -268,7 +310,8 @@ fn validate_names(names: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn verify_dist(archive: &Path) -> io::Result<()> {
+#[cfg(unix)]
+fn verify_dist_unix(archive: &Path) -> io::Result<()> {
     let names = list_archive(archive)?;
     validate_names(&names)?;
     if !names.iter().any(|name| name == "wiiland-2/verify-dist.sh") {
@@ -305,8 +348,19 @@ pub fn verify_dist(archive: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
+pub fn verify_dist(archive: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        verify_dist_unix(archive)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = archive;
+        Err(unsupported_unix_packaging())
+    }
+}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

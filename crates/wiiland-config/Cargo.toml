@@ -10,9 +10,17 @@ name = "wiiland-config"
 path = "src/main.rs"
 
 [dependencies]
-libc.workspace = true
 wiiland-ipc = { path = "../wiiland-ipc" }
 eframe.workspace = true
 egui.workspace = true
 tempfile.workspace = true
 wiiland-core = { path = "../wiiland-core" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+] }

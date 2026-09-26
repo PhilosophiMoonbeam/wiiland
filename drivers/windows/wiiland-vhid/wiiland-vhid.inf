@@ -1,0 +1,74 @@
+; This package targets Windows 10 22H2 (build 19045) and later on x64/ARM64.
+; Release deployment still requires an approved, signed driver package. This INF
+; contains no test certificate, private key, or production-signing shortcut.
+; The VHF child currently uses unassigned VendorID 0xFFFF/ProductID 0x0001 as
+; a prototype identity, not an official test allocation; do not ship it as a
+; production identity until WiiLand has an authorized, unique VID/PID.
+; The broker service name is WiiLandOutput. Its installer must enable the
+; per-service SID (SERVICE_SID_TYPE_UNRESTRICTED or RESTRICTED) so its token
+; contains the SID granted below. BA remains an intentional admin maintenance
+; ACE; the ACL is narrower than ordinary users but not service-exclusive.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+DriverVer   = 09/26/2026,1.0.0.0
+CatalogFile = wiiland-vhid.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = WiiLandModels,NTamd64.10.0...19045,NTarm64.10.0...19045
+
+[WiiLandModels.NTamd64.10.0...19045]
+%DeviceDescription% = WiiLandVhid_Install,ROOT\WIILANDVHID
+
+[WiiLandModels.NTarm64.10.0...19045]
+%DeviceDescription% = WiiLandVhid_Install,ROOT\WIILANDVHID
+
+[DestinationDirs]
+DriverCopyFiles = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+wiiland-vhid.sys = 1
+
+[WiiLandVhid_Install.NT]
+CopyFiles = DriverCopyFiles
+
+[WiiLandVhid_Install.NT.HW]
+AddReg = WiiLandVhid_Device_AddReg
+
+[WiiLandVhid_Device_AddReg]
+HKR,,DeviceType,0x00010001,0x00000022
+HKR,,Security,0x00000000,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-80-1241230009-753320945-3337858623-1414713134-139777188)"
+; VHF requires vhf.sys as a lower filter on the HID source device stack.
+HKR,,LowerFilters,0x00010000,"vhf"
+
+[WiiLandVhid_Install.NT.Services]
+AddService = WiiLandVhid,0x00000002,WiiLandVhid_Service_Install
+
+[WiiLandVhid_Service_Install]
+DisplayName   = %ServiceDescription%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\wiiland-vhid.sys
+
+[WiiLandVhid_Install.NT.Wdf]
+KmdfService = WiiLandVhid,WiiLandVhid_Wdf
+
+[WiiLandVhid_Wdf]
+KmdfLibraryVersion = 1.31
+
+[DriverCopyFiles]
+wiiland-vhid.sys
+
+[Strings]
+ProviderName       = "WiiLand"
+DeviceDescription  = "WiiLand Virtual HID Source"
+ServiceDescription = "WiiLand Virtual HID Source Driver"
+DiskName           = "WiiLand Virtual HID Driver Package"

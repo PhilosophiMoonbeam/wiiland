@@ -37,7 +37,14 @@ fn err_line(result: Result<(), ConfigError>, line: usize, fragment: &str) {
 #[test]
 fn defaults_and_all_scalar_lines_match_contract() {
     let mut config = Config::default();
+    #[cfg(target_os = "linux")]
     assert_eq!(config.backend, Backend::Uinput);
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(config.backend, Backend::Auto);
+    #[cfg(target_os = "linux")]
+    assert!(config.dump().starts_with("backend=uinput\n"));
+    #[cfg(not(target_os = "linux"))]
+    assert!(config.dump().starts_with("backend=auto\n"));
     assert_eq!(config.profile, Profile::GAMEPAD);
     assert_eq!(config.pointer_speed, 16);
     assert_eq!(config.ir_speed, 8);
@@ -116,6 +123,60 @@ fn defaults_and_all_scalar_lines_match_contract() {
         })
     );
     config.validate().unwrap();
+}
+
+#[test]
+fn backend_values_parse_serialize_and_round_trip() {
+    for (name, backend) in [
+        ("auto", Backend::Auto),
+        ("uinput", Backend::Uinput),
+        ("windows-vhf", Backend::WindowsVhf),
+    ] {
+        let source = format!("backend={name}\n");
+        let config = Config::parse_bytes("backend", source.as_bytes()).unwrap();
+        assert_eq!(config.backend, backend);
+
+        let dump = config.dump();
+        assert!(dump.starts_with(&source));
+        assert_eq!(
+            Config::parse_bytes("backend-dump", dump.as_bytes()).unwrap(),
+            config
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backend_resolution_on_linux_rejects_windows_without_fallback() {
+    assert_eq!(
+        Backend::Auto.resolve_for_current_platform(),
+        Ok(Backend::Uinput)
+    );
+    assert_eq!(
+        Backend::Uinput.resolve_for_current_platform(),
+        Ok(Backend::Uinput)
+    );
+    assert!(Backend::WindowsVhf.resolve_for_current_platform().is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn backend_resolution_on_windows_rejects_uinput_without_fallback() {
+    assert_eq!(
+        Backend::Auto.resolve_for_current_platform(),
+        Ok(Backend::WindowsVhf)
+    );
+    assert_eq!(
+        Backend::WindowsVhf.resolve_for_current_platform(),
+        Ok(Backend::WindowsVhf)
+    );
+    assert!(Backend::Uinput.resolve_for_current_platform().is_err());
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+#[test]
+fn backend_resolution_rejects_unsupported_targets() {
+    assert!(Backend::Auto.resolve_for_current_platform().is_err());
 }
 
 #[test]

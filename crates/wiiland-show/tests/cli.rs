@@ -1,18 +1,21 @@
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-const PROGRAM: &str = "wiiland-show";
+fn run(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_wiiland-show"))
+        .args(args)
+        .output()
+        .expect("wiiland-show binary")
+}
 
+#[cfg(unix)]
 fn run_as(program: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_wiiland-show"))
         .arg0(program)
         .args(args)
         .output()
         .expect("wiiland-show binary")
-}
-
-fn run(args: &[&str]) -> std::process::Output {
-    run_as(PROGRAM, args)
 }
 
 #[test]
@@ -57,6 +60,7 @@ fn missing_and_surplus_selectors_are_strict() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn help_and_errors_use_the_argv_program_name() {
     const ALTERNATE_PROGRAM: &str = "alternate-wiiland-show";
@@ -101,6 +105,7 @@ fn list_is_pipeline_safe() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn default_list_uses_the_daemon_without_opening_hardware() {
     use std::io::{BufRead, BufReader, Write};

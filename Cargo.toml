@@ -8,6 +8,7 @@ members = [
     "crates/wiiland-ipc",
     "crates/wiiland-show",
     "crates/wiiland-dump",
+    "crates/wiiland-output-service",
     "xtask",
 ]
 

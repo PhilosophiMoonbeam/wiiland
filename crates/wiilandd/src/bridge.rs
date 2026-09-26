@@ -1,18 +1,31 @@
 //! Per-device event bridge and output lifecycle.
+#[cfg(target_os = "linux")]
 use crate::uinput::{Backend, VirtualDevice, VirtualKind};
+#[cfg(windows)]
+#[path = "windows_output.rs"]
+pub mod windows_output;
 use std::cell::Cell;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::rc::Rc;
+use wiiland_core::engine::EngineInput;
+#[cfg(target_os = "linux")]
 use wiiland_core::engine::{
-    DeviceEngine, EngineInput, OutputAction, OutputDevice, needs_desktop, needs_gamepad,
+    DeviceEngine, OutputAction, OutputDevice, needs_desktop, needs_gamepad,
 };
 use wiiland_core::mapping::{Abs3, MotionKind};
 use wiiland_core::pointer::{IrFrame, IrPoint};
 use wiiland_core::{
     AbsPayload, Config, KeyPayload, Profile, TraceEvent, TraceFilter, TracePayload,
 };
-use wiiland_hid::{Axis3, Button, ButtonState, Event, EventKind, Interface, InterfaceMask};
+#[cfg(target_os = "linux")]
+use wiiland_hid::Interface;
+use wiiland_hid::{Axis3, Button, ButtonState, Event, EventKind, InterfaceMask};
+
+#[cfg(windows)]
+pub use windows_output::{WindowsBridgeDevice, WindowsOutputSession};
 
 pub const MAX_EVENTS_PER_DRAIN: usize = 256;
 pub const PROFILE_GAMEPAD: u8 = Profile::GAMEPAD.bits();
@@ -84,6 +97,7 @@ impl TraceContext {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub struct BridgeDevice<B: Backend + Clone = crate::uinput::SystemBackend> {
     pub(crate) syspath: PathBuf,
     pub(crate) profile: Profile,
@@ -100,11 +114,13 @@ pub struct BridgeDevice<B: Backend + Clone = crate::uinput::SystemBackend> {
     outputs_enabled: bool,
     capture: bool,
 }
+#[cfg(target_os = "linux")]
 impl BridgeDevice<crate::uinput::SystemBackend> {
     pub fn new(path: impl AsRef<Path>, config: &Config) -> Result<Self, i32> {
         Self::with_backend(path, config, crate::uinput::SystemBackend)
     }
 }
+#[cfg(target_os = "linux")]
 impl<B: Backend + Clone> BridgeDevice<B> {
     pub fn with_backend(path: impl AsRef<Path>, config: &Config, backend: B) -> Result<Self, i32> {
         Self::with_backend_outputs(path, config, backend, true)
@@ -365,6 +381,7 @@ fn engine_input(kind: EventKind) -> Option<EngineInput> {
     Some(EngineInput::Motion { kind: motion, axes })
 }
 
+#[cfg(target_os = "linux")]
 impl<B: Backend + Clone> Drop for BridgeDevice<B> {
     fn drop(&mut self) {
         self.gamepad.take();
@@ -379,7 +396,9 @@ fn profile_for_device(config: &Config, syspath: &Path, devtype: Option<&[u8]>) -
         .filter(|value| !value.is_empty());
     config.profile_for_device(Some(&syspath), devtype)
 }
+#[cfg(target_os = "linux")]
 type OutputPair<B> = (Option<VirtualDevice<B>>, Option<VirtualDevice<B>>);
+#[cfg(target_os = "linux")]
 fn create_outputs<B: Backend + Clone>(
     profile: Profile,
     config: &Config,
@@ -462,6 +481,7 @@ fn axis_events(kind: &EventKind) -> &[Axis3] {
     }
 }
 
+#[cfg(not(windows))]
 fn monotonic_time_us() -> i64 {
     let mut now = libc::timespec {
         tv_sec: 0,
@@ -473,6 +493,13 @@ fn monotonic_time_us() -> i64 {
     now.tv_sec
         .saturating_mul(1_000_000)
         .saturating_add(now.tv_nsec / 1_000)
+}
+
+#[cfg(windows)]
+fn monotonic_time_us() -> i64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    i64::try_from(START.elapsed().as_micros()).unwrap_or(i64::MAX)
 }
 
 fn format_trace_line(sequence: u64, monotonic_us: i64, syspath: &Path, event: &Event) -> String {
@@ -509,7 +536,7 @@ fn format_trace_line(sequence: u64, monotonic_us: i64, syspath: &Path, event: &E
     line
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::uinput::{RecordingBackend, RecordingOp};

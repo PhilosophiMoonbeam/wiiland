@@ -349,3 +349,133 @@ jobs:
           cargo xtask dist --output "$second"
           cmp --silent "$first" "$second"
           cargo xtask verify-dist "$first"
+
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.98 x64 MSVC toolchain
+        shell: pwsh
+        run: |
+          $toolchain = '1.98.0-x86_64-pc-windows-msvc'
+          rustup toolchain install $toolchain --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $toolchain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = rustc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($version -notmatch '^rustc 1\.98\.0(?:\s|$)') {
+            throw "Expected Rust 1.98.0, got: $version"
+          }
+          $rustHostLine = rustc -vV | Select-String '^host: '
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $rustHostLine -or $rustHostLine.Line -ne 'host: x86_64-pc-windows-msvc') {
+            throw "Expected x86_64-pc-windows-msvc, got: $rustHostLine"
+          }
+
+      - name: Check the locked Windows workspace
+        shell: pwsh
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Run strict Windows clippy
+        shell: pwsh
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run locked Windows workspace tests
+        shell: pwsh
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build the real daemon and IPC status example
+        shell: pwsh
+        run: |
+          cargo build --locked -p wiilandd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked -p wiiland-ipc --example status
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke real daemon dry-run and IPC status (no hardware or driver test)
+        shell: pwsh
+        run: |
+          # The Windows client accepts only the current-logon default pipe, so use both defaults.
+          $daemon = Join-Path $env:GITHUB_WORKSPACE 'target\debug\wiilandd.exe'
+          $statusClient = Join-Path $env:GITHUB_WORKSPACE 'target\debug\examples\status.exe'
+          $daemonStdout = Join-Path $env:RUNNER_TEMP 'wiilandd-windows-smoke.stdout'
+          $daemonStderr = Join-Path $env:RUNNER_TEMP 'wiilandd-windows-smoke.stderr'
+          if (-not (Test-Path $daemon)) { throw "Missing daemon executable: $daemon" }
+          if (-not (Test-Path $statusClient)) { throw "Missing IPC status client: $statusClient" }
+
+          $daemonProcess = $null
+          try {
+            $daemonProcess = Start-Process `
+              -FilePath $daemon `
+              -ArgumentList @('--no-config', '--dry-run') `
+              -WorkingDirectory $env:GITHUB_WORKSPACE `
+              -PassThru `
+              -NoNewWindow `
+              -RedirectStandardOutput $daemonStdout `
+              -RedirectStandardError $daemonStderr
+
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            $statusReady = $false
+            while ([DateTime]::UtcNow -lt $deadline) {
+              $daemonProcess.Refresh()
+              if ($daemonProcess.HasExited) {
+                throw "wiilandd exited before Windows IPC status became available (exit $($daemonProcess.ExitCode))"
+              }
+              $statusLines = @(& $statusClient 2>&1)
+              $statusExit = $LASTEXITCODE
+              if ($statusExit -eq 0) {
+                $statusReady = $true
+                break
+              }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not $statusReady) {
+              throw 'Timed out waiting for wiilandd Windows IPC status'
+            }
+
+            $statusText = $statusLines -join "`n"
+            $statusLines | Write-Output
+            if ($statusText -notmatch '(?m)^daemon_version=\S+$') {
+              throw 'IPC status did not return a daemon version'
+            }
+            if ($statusText -notmatch "(?m)^pid=$($daemonProcess.Id)$") {
+              throw 'IPC status PID did not match the running daemon'
+            }
+            if ($statusText -notmatch '(?m)^device_count=0$') {
+              throw 'IPC status did not report zero opened devices'
+            }
+            if ($statusText -notmatch '(?m)^dry_run=true$') {
+              throw 'IPC status did not report dry-run mode'
+            }
+            if ($statusText -notmatch '(?m)^socket_path=\\\\\.\\pipe\\WiiLand\.S-1-5-5-\d+-\d+\.daemon$') {
+              throw 'IPC status did not report the current Windows logon named-pipe endpoint'
+            }
+            $daemonProcess.Refresh()
+            if ($daemonProcess.HasExited) {
+              throw "wiilandd exited after replying to IPC status (exit $($daemonProcess.ExitCode))"
+            }
+            Write-Output 'Smoke scope: daemon dry-run and current-logon named-pipe IPC only; no physical Wii Remote or signed VHF driver test.'
+          }
+          catch {
+            if ($daemonProcess) {
+              $daemonProcess.Refresh()
+              if (-not $daemonProcess.HasExited) {
+                Stop-Process -Id $daemonProcess.Id -Force -ErrorAction SilentlyContinue
+                $daemonProcess.WaitForExit()
+              }
+            }
+            if (Test-Path $daemonStdout) { Get-Content $daemonStdout }
+            if (Test-Path $daemonStderr) { Get-Content $daemonStderr }
+            throw
+          }
+          finally {
+            if ($daemonProcess) {
+              $daemonProcess.Refresh()
+              if (-not $daemonProcess.HasExited) {
+                Stop-Process -Id $daemonProcess.Id -Force -ErrorAction SilentlyContinue
+                $daemonProcess.WaitForExit()
+              }
+            }
+          }

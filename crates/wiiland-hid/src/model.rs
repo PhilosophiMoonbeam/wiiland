@@ -3,11 +3,17 @@
 //! The kernel-facing constants and representations in this module are crate
 //! private implementation details; they are not an ABI or API promise.
 
+#[cfg(not(windows))]
 pub(crate) const DRUM_SLOT_COUNT: usize = 8;
+#[cfg(not(windows))]
 pub(crate) const EV_SYN: u16 = 0;
+#[cfg(not(windows))]
 pub(crate) const EV_KEY: u16 = 1;
+#[cfg(not(windows))]
 pub(crate) const EV_ABS: u16 = 3;
+#[cfg(not(windows))]
 pub(crate) const SYN_REPORT: u16 = 0;
+#[cfg(not(windows))]
 pub(crate) const SYN_DROPPED: u16 = 3;
 
 /// A three-axis sample or one logical slot in a multi-axis report.
@@ -26,9 +32,15 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
+    #[cfg(not(windows))]
     pub(crate) fn from_timeval(time: libc::timeval) -> Self {
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        let seconds = time.tv_sec;
+        #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+        let seconds = i64::from(time.tv_sec);
+
         Self {
-            seconds: time.tv_sec,
+            seconds,
             microseconds: u32::try_from(time.tv_usec).unwrap_or(0).min(999_999),
         }
     }
@@ -36,6 +48,7 @@ impl Timestamp {
 
 pub use wiiland_core::input::{Button, ButtonEvent, ButtonState};
 
+#[cfg(not(windows))]
 /// A raw Linux input event consumed by the private decoder.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct InputEvent {
@@ -45,6 +58,7 @@ pub(crate) struct InputEvent {
     pub(crate) value: i32,
 }
 
+#[cfg(not(windows))]
 impl PartialEq for InputEvent {
     fn eq(&self, other: &Self) -> bool {
         self.time.tv_sec == other.time.tv_sec
@@ -54,6 +68,7 @@ impl PartialEq for InputEvent {
             && self.value == other.value
     }
 }
+#[cfg(not(windows))]
 impl Eq for InputEvent {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -77,6 +92,7 @@ impl InterfaceMask {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+    #[cfg(not(windows))]
     pub(crate) const fn from_bits(bits: u32) -> Self {
         Self(bits)
     }
@@ -123,50 +139,97 @@ impl core::ops::Not for InterfaceMask {
 }
 
 // Common evdev key/absolute codes. These stay private to the decoder.
+#[cfg(not(windows))]
 pub(crate) const KEY_LEFT: u16 = 105;
+#[cfg(not(windows))]
 pub(crate) const KEY_RIGHT: u16 = 106;
+#[cfg(not(windows))]
 pub(crate) const KEY_UP: u16 = 103;
+#[cfg(not(windows))]
 pub(crate) const KEY_DOWN: u16 = 108;
+#[cfg(not(windows))]
 pub(crate) const KEY_NEXT: u16 = 0x197;
+#[cfg(not(windows))]
 pub(crate) const KEY_PREVIOUS: u16 = 0x19c;
+#[cfg(not(windows))]
 pub(crate) const BTN_1: u16 = 0x101;
+#[cfg(not(windows))]
 pub(crate) const BTN_2: u16 = 0x102;
+#[cfg(not(windows))]
 pub(crate) const BTN_3: u16 = 0x103;
+#[cfg(not(windows))]
 pub(crate) const BTN_4: u16 = 0x104;
+#[cfg(not(windows))]
 pub(crate) const BTN_5: u16 = 0x105;
+#[cfg(not(windows))]
 pub(crate) const BTN_A: u16 = 0x130;
+#[cfg(not(windows))]
 pub(crate) const BTN_B: u16 = 0x131;
+#[cfg(not(windows))]
 pub(crate) const BTN_C: u16 = 0x132;
+#[cfg(not(windows))]
 pub(crate) const BTN_X: u16 = 0x133;
+#[cfg(not(windows))]
 pub(crate) const BTN_Y: u16 = 0x134;
+#[cfg(not(windows))]
 pub(crate) const BTN_Z: u16 = 0x135;
+#[cfg(not(windows))]
 pub(crate) const BTN_TL: u16 = 0x136;
+#[cfg(not(windows))]
 pub(crate) const BTN_TR: u16 = 0x137;
+#[cfg(not(windows))]
 pub(crate) const BTN_TL2: u16 = 0x138;
+#[cfg(not(windows))]
 pub(crate) const BTN_TR2: u16 = 0x139;
+#[cfg(not(windows))]
 pub(crate) const BTN_SELECT: u16 = 0x13a;
+#[cfg(not(windows))]
 pub(crate) const BTN_START: u16 = 0x13b;
+#[cfg(not(windows))]
 pub(crate) const BTN_MODE: u16 = 0x13c;
+#[cfg(not(windows))]
 pub(crate) const BTN_THUMBL: u16 = 0x13d;
+#[cfg(not(windows))]
 pub(crate) const BTN_THUMBR: u16 = 0x13e;
+#[cfg(not(windows))]
 pub(crate) const BTN_DPAD_UP: u16 = 0x220;
+#[cfg(not(windows))]
 pub(crate) const BTN_DPAD_DOWN: u16 = 0x221;
+#[cfg(not(windows))]
 pub(crate) const BTN_DPAD_LEFT: u16 = 0x222;
+#[cfg(not(windows))]
 pub(crate) const BTN_DPAD_RIGHT: u16 = 0x223;
+#[cfg(not(windows))]
 pub(crate) const BTN_EAST: u16 = BTN_B;
+#[cfg(not(windows))]
 pub(crate) const BTN_SOUTH: u16 = BTN_A;
+#[cfg(not(windows))]
 pub(crate) const BTN_NORTH: u16 = BTN_X;
+#[cfg(not(windows))]
 pub(crate) const BTN_WEST: u16 = BTN_Y;
+#[cfg(not(windows))]
 pub(crate) const ABS_X: u16 = 0;
+#[cfg(not(windows))]
 pub(crate) const ABS_Y: u16 = 1;
+#[cfg(not(windows))]
 pub(crate) const ABS_RX: u16 = 3;
+#[cfg(not(windows))]
 pub(crate) const ABS_RY: u16 = 4;
+#[cfg(not(windows))]
 pub(crate) const ABS_RZ: u16 = 5;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT0X: u16 = 16;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT0Y: u16 = 17;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT1X: u16 = 18;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT1Y: u16 = 19;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT2X: u16 = 20;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT2Y: u16 = 21;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT3X: u16 = 22;
+#[cfg(not(windows))]
 pub(crate) const ABS_HAT3Y: u16 = 23;

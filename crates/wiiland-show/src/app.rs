@@ -516,21 +516,41 @@ pub fn key_name(button: Button) -> &'static str {
 }
 
 pub fn parse_selector(arg: &str) -> Result<Selector<'_>, &'static str> {
+    #[cfg(not(windows))]
     if let Some(path) = arg.strip_prefix("/sys/")
         && !path.is_empty()
     {
         return Ok(Selector::Path(Path::new(arg)));
     }
-    if arg.is_empty() || !arg.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("selector must be a positive ordinal or an absolute /sys path");
+    if arg.is_empty() {
+        return Err(selector_error());
     }
-    let value = arg
-        .parse::<usize>()
-        .map_err(|_| "selector ordinal is out of range")?;
-    if value == 0 {
-        return Err("selector must be a positive ordinal or an absolute /sys path");
+    if arg.bytes().all(|b| b.is_ascii_digit()) {
+        let value = arg
+            .parse::<usize>()
+            .map_err(|_| "selector ordinal is out of range")?;
+        if value == 0 {
+            return Err(selector_error());
+        }
+        return Ok(Selector::Ordinal(value));
     }
-    Ok(Selector::Ordinal(value))
+    #[cfg(windows)]
+    {
+        Ok(Selector::Path(Path::new(arg)))
+    }
+    #[cfg(not(windows))]
+    {
+        Err(selector_error())
+    }
+}
+
+#[cfg(windows)]
+fn selector_error() -> &'static str {
+    "selector must be a positive ordinal or an opaque Windows HID device ID"
+}
+#[cfg(not(windows))]
+fn selector_error() -> &'static str {
+    "selector must be a positive ordinal or an absolute /sys path"
 }
 pub enum Selector<'a> {
     Ordinal(usize),

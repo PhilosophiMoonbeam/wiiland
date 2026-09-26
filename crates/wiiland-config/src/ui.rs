@@ -127,9 +127,17 @@ pub struct ControlCenter {
     pub model: ConfigModel,
     config_task: Option<PendingConfig>,
     command_task: Option<(String, ProcessTask)>,
+    #[cfg(not(windows))]
     service_task: Option<(String, ProcessTask)>,
     pending_service_actions: PendingServiceActions,
+    #[cfg(not(windows))]
     service_program: &'static str,
+    #[cfg(windows)]
+    daemon_action_task: Option<(String, crate::live::DaemonActionTask)>,
+    #[cfg(windows)]
+    installation_query: Option<crate::live::InstallationQuery>,
+    #[cfg(windows)]
+    installation_status: Option<crate::live::InstallationStatus>,
     validation_task: Option<ValidationTask>,
     tab: Tab,
     config_section: ConfigSection,
@@ -154,9 +162,17 @@ impl ControlCenter {
             model,
             config_task: None,
             command_task: None,
+            #[cfg(not(windows))]
             service_task: None,
             pending_service_actions: PendingServiceActions::default(),
+            #[cfg(not(windows))]
             service_program: "systemctl",
+            #[cfg(windows)]
+            daemon_action_task: None,
+            #[cfg(windows)]
+            installation_query: None,
+            #[cfg(windows)]
+            installation_status: None,
             validation_task: None,
             tab: Tab::Overview,
             config_section: ConfigSection::Pointer,
@@ -177,14 +193,32 @@ impl ControlCenter {
     }
 
     pub fn initialize(model: ConfigModel) -> Self {
+        #[cfg(windows)]
+        let mut model = model;
+        #[cfg(windows)]
+        if let Ok(path) = crate::live::trusted_daemon_path() {
+            model.daemon_path = path.to_string_lossy().into_owned();
+        }
         let mut application = Self::new(model);
         application.begin_load(false);
         application.service_action("is-active");
-        application.ipc_query = Some(crate::live::Query::start(false));
+        #[cfg(windows)]
+        {
+            application.installation_query = Some(crate::live::InstallationQuery::start());
+        }
+        #[cfg(not(windows))]
+        {
+            application.ipc_query = Some(crate::live::Query::start(false));
+        }
         application
     }
 
     pub fn backend_name() -> &'static str {
+        #[cfg(windows)]
+        {
+            "Windows"
+        }
+        #[cfg(not(windows))]
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             "Wayland"
         } else if std::env::var_os("DISPLAY").is_some() {
@@ -196,6 +230,10 @@ impl ControlCenter {
 
     pub fn begin_load(&mut self, _report_errors: bool) {
         if self.config_task.is_some() {
+            return;
+        }
+        if self.model.config_path.as_os_str().is_empty() {
+            self.status = "Choose a configuration target before loading".to_owned();
             return;
         }
         let Some(transaction) = self.model.begin(TransactionKind::Load, Vec::new()) else {
@@ -368,13 +406,20 @@ impl ControlCenter {
     }
 
     fn service_action(&mut self, action: &str) {
-        if self.service_task.is_some() {
+        #[cfg(windows)]
+        let busy = self.daemon_action_task.is_some();
+        #[cfg(not(windows))]
+        let busy = self.service_task.is_some();
+        if busy {
             return;
         }
         self.dispatch_service_action(action);
     }
 
     fn request_restart_after_save(&mut self) {
+        #[cfg(windows)]
+        let active = self.daemon_action_task.is_some();
+        #[cfg(not(windows))]
         let active = self.service_task.is_some();
         if let Some(action) = self.pending_service_actions.request_restart(active) {
             self.dispatch_service_action(action.as_str());
@@ -384,48 +429,167 @@ impl ControlCenter {
     }
 
     fn dispatch_service_action(&mut self, action: &str) {
-        let args = process::service_args(action);
-        self.model.append_output(&format!(
-            "$ {} {}\n",
-            self.service_program,
-            shell_args(&args)
-        ));
-        self.service_status = format!("{}…", capitalize(action));
-        self.service_task = Some((
-            action.to_owned(),
+        #[cfg(windows)]
+        {
             if action == "is-active" {
-                ProcessTask::spawn_capturing_stdout(self.service_program, &args)
-            } else {
-                ProcessTask::spawn(self.service_program, &args)
-            },
-        ));
+                if self.ipc_query.is_none() {
+                    self.service_status = "Checking…".to_owned();
+                    self.daemon_status = "Daemon status checking…".to_owned();
+                    self.ipc_query = Some(crate::live::Query::start(false));
+                }
+                return;
+            }
+            if self.daemon_action_task.is_some() {
+                return;
+            }
+            let action_kind = match action {
+                "start" => crate::live::DaemonAction::Start,
+                "stop" => crate::live::DaemonAction::Stop,
+                "restart" => crate::live::DaemonAction::Restart,
+                _ => {
+                    self.status = format!("Unsupported Windows daemon action: {action}");
+                    return;
+                }
+            };
+            self.ipc_query = None;
+            self.model.append_output(&format!(
+                "$ WiiLand daemon {action} · installer startup value HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\WiiLandDaemon\n"
+            ));
+            self.service_status = format!("{}…", capitalize(action));
+            self.daemon_action_task = Some((
+                action.to_owned(),
+                crate::live::DaemonActionTask::start(action_kind),
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            let args = process::service_args(action);
+            self.model.append_output(&format!(
+                "$ {} {}\n",
+                self.service_program,
+                shell_args(&args)
+            ));
+            self.service_status = format!("{}…", capitalize(action));
+            self.service_task = Some((
+                action.to_owned(),
+                if action == "is-active" {
+                    ProcessTask::spawn_capturing_stdout(self.service_program, &args)
+                } else {
+                    ProcessTask::spawn(self.service_program, &args)
+                },
+            ));
+        }
     }
 
     fn poll_service(&mut self) {
-        let Some((action, task)) = self.service_task.as_ref() else {
+        #[cfg(windows)]
+        {
+            self.poll_windows_service();
+        }
+        #[cfg(not(windows))]
+        {
+            let Some((action, task)) = self.service_task.as_ref() else {
+                return;
+            };
+            let result = match poll_process(task, &mut self.model) {
+                Some(result) => result,
+                None => return,
+            };
+            let action = action.clone();
+            self.service_task = None;
+            self.append_result_error(&result);
+            if action == "is-active" {
+                self.service_status = service_query_status(&result).to_owned();
+            } else if result.success {
+                self.status = format!("Service {action} succeeded");
+            } else {
+                self.service_status = "Unavailable".to_owned();
+                self.status = format!("Service {action} failed · see activity log");
+                self.output_open = true;
+            }
+            if let Some(next) = self.pending_service_actions.after_completion() {
+                self.dispatch_service_action(next.as_str());
+            } else if action != "is-active" && result.success {
+                self.dispatch_service_action("is-active");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn poll_windows_service(&mut self) {
+        let Some((action, task)) = self.daemon_action_task.as_ref() else {
             return;
         };
-        let result = match poll_process(task, &mut self.model) {
-            Some(result) => result,
-            None => return,
+        let Some(result) = task.poll() else {
+            return;
         };
         let action = action.clone();
-        self.service_task = None;
-        self.append_result_error(&result);
-        if action == "is-active" {
-            self.service_status = service_query_status(&result).to_owned();
-        } else if result.success {
-            self.status = format!("Service {action} succeeded");
-        } else {
-            self.service_status = "Unavailable".to_owned();
-            self.status = format!("Service {action} failed · see activity log");
-            self.output_open = true;
+        let stopped = result
+            .as_ref()
+            .is_ok_and(|outcome| *outcome == crate::live::DaemonActionResult::Stopped);
+        self.daemon_action_task = None;
+        match result {
+            Ok(outcome) => {
+                self.service_status = match outcome {
+                    crate::live::DaemonActionResult::Stopped => "Stopped",
+                    crate::live::DaemonActionResult::Started
+                    | crate::live::DaemonActionResult::AlreadyRunning
+                    | crate::live::DaemonActionResult::Restarted => "Running",
+                }
+                .to_owned();
+                self.daemon_status = match outcome {
+                    crate::live::DaemonActionResult::Stopped => "Daemon stopped",
+                    crate::live::DaemonActionResult::Started
+                    | crate::live::DaemonActionResult::AlreadyRunning
+                    | crate::live::DaemonActionResult::Restarted => "Daemon running",
+                }
+                .to_owned();
+                self.status = match outcome {
+                    crate::live::DaemonActionResult::Started => "Daemon started and IPC is ready",
+                    crate::live::DaemonActionResult::AlreadyRunning => "Daemon is already running",
+                    crate::live::DaemonActionResult::Stopped => "Daemon stopped gracefully",
+                    crate::live::DaemonActionResult::Restarted => {
+                        "Daemon restarted and IPC is ready"
+                    }
+                }
+                .to_owned();
+                self.model.append_output(&format!("{}\n", self.status));
+            }
+            Err(error) => {
+                self.service_status = "Unavailable".to_owned();
+                self.status = format!("Daemon {action} failed · {error}");
+                self.model.append_output(&format!("{}\n", self.status));
+                self.output_open = true;
+            }
         }
         if let Some(next) = self.pending_service_actions.after_completion() {
             self.dispatch_service_action(next.as_str());
-        } else if action != "is-active" && result.success {
+        } else if !stopped {
             self.dispatch_service_action("is-active");
         }
+    }
+
+    #[cfg(windows)]
+    fn service_controls_busy(&self) -> bool {
+        self.daemon_action_task.is_some() || self.ipc_query.is_some()
+    }
+
+    #[cfg(not(windows))]
+    fn service_controls_busy(&self) -> bool {
+        self.service_task.is_some()
+    }
+
+    #[cfg(windows)]
+    fn poll_installation_query(&mut self) {
+        let Some(status) = self
+            .installation_query
+            .as_ref()
+            .and_then(crate::live::InstallationQuery::poll)
+        else {
+            return;
+        };
+        self.installation_query = None;
+        self.installation_status = Some(status);
     }
 
     fn start_trace(&mut self) {
@@ -684,11 +848,16 @@ impl ControlCenter {
     }
 
     fn draw_service_card(&mut self, ui: &mut egui::Ui) {
+        let busy = self.service_controls_busy();
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.heading("Background service");
+            ui.heading(if cfg!(windows) {
+                "Per-user daemon"
+            } else {
+                "Background service"
+            });
             ui.horizontal_wrapped(|ui| {
-                if self.service_task.is_some() {
+                if busy {
                     ui.spinner();
                 }
                 theme::badge(
@@ -697,41 +866,120 @@ impl ControlCenter {
                     matches!(self.service_status.as_str(), "Unavailable" | "Failed" | "Stopped"),
                 );
             });
-            theme::note(ui, match self.service_status.as_str() {
-                "Unavailable" => "Cannot reach the user service. Check readiness for installation and permission details.",
-                "Stopped" => "Start the service to connect controllers and capture live input.",
-                "Failed" => "The service failed. Check readiness, then try starting it again.",
-                "Running" => "Saved controls are handled in the background.",
-                _ => "Checking the user service. Refresh to request its current state.",
-            });
+            theme::note(
+                ui,
+                if cfg!(windows) {
+                    match self.service_status.as_str() {
+                        "Unavailable" => "Cannot reach the authenticated per-user daemon endpoint. Check the installed WiiLand daemon and try Start.",
+                        "Stopped" => "Start the per-user daemon to connect controllers and capture live input.",
+                        "Failed" => "The daemon failed. Check readiness, then try starting it again.",
+                        "Running" => "The per-user daemon is running. Stop requests graceful shutdown through its logon-scoped event.",
+                        _ => "Checking daemon IPC. Refresh to request its current state.",
+                    }
+                } else {
+                    match self.service_status.as_str() {
+                        "Unavailable" => "Cannot reach the user service. Check readiness for installation and permission details.",
+                        "Stopped" => "Start the service to connect controllers and capture live input.",
+                        "Failed" => "The service failed. Check readiness, then try starting it again.",
+                        "Running" => "Saved controls are handled in the background.",
+                        _ => "Checking the user service. Refresh to request its current state.",
+                    }
+                },
+            );
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 let running = self.service_status == "Running";
-                let (label, action) = if running { ("Restart", "restart") } else { ("Start", "start") };
-                if theme::primary(ui, label, self.service_task.is_none()).clicked() {
+                let (label, action) = if running {
+                    ("Restart", "restart")
+                } else {
+                    ("Start", "start")
+                };
+                if theme::primary(ui, label, !busy).clicked() {
                     self.service_action(action);
                 }
-                if ui.add_enabled(self.service_task.is_none(), egui::Button::new("Refresh")).clicked() {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Refresh"))
+                    .clicked()
+                {
                     self.service_action("is-active");
                 }
-                ui.menu_button("Service actions", |ui| {
-                    for (label, action) in [("Start", "start"), ("Stop", "stop"), ("Restart", "restart")] {
-                        if ui.add_enabled(self.service_task.is_none(), egui::Button::new(label)).clicked() {
-                            self.service_action(action);
-                            ui.close();
+                ui.menu_button(
+                    if cfg!(windows) {
+                        "Daemon actions"
+                    } else {
+                        "Service actions"
+                    },
+                    |ui| {
+                        for (label, action) in [
+                            ("Start", "start"),
+                            ("Stop", "stop"),
+                            ("Restart", "restart"),
+                        ] {
+                            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                                self.service_action(action);
+                                ui.close();
+                            }
                         }
-                    }
-                });
+                    },
+                );
             });
             ui.add_space(4.0);
-            ui.add(egui::Label::new(egui::RichText::new(&self.daemon_status)
-                .small().color(theme::Palette::for_ui(ui).muted)).wrap());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&self.daemon_status)
+                        .small()
+                        .color(theme::Palette::for_ui(ui).muted),
+                )
+                .wrap(),
+            );
             ui.horizontal(|ui| {
-                if ui.add_enabled(self.ipc_query.is_none(), egui::Button::new("Refresh daemon status")).clicked() {
+                if ui
+                    .add_enabled(
+                        self.ipc_query.is_none(),
+                        egui::Button::new("Refresh daemon status"),
+                    )
+                    .clicked()
+                {
                     self.ipc_query = Some(crate::live::Query::start(false));
                     self.output_open = true;
                 }
             });
+            #[cfg(windows)]
+            {
+                ui.separator();
+                ui.label("Windows installation · no elevation required");
+                let state = self.installation_status.as_ref();
+                ui.add(
+                    egui::Label::new(format!(
+                        "Startup integration · {}",
+                        state.map_or("Checking…", |state| state.startup.as_str())
+                    ))
+                    .wrap(),
+                );
+                ui.add(
+                    egui::Label::new(format!(
+                        "Output broker · {}",
+                        state.map_or("Checking…", |state| state.broker.as_str())
+                    ))
+                    .wrap(),
+                );
+                ui.add(
+                    egui::Label::new(format!(
+                        "Virtual HID driver · {}",
+                        state.map_or("Checking…", |state| state.driver.as_str())
+                    ))
+                    .wrap(),
+                );
+                if ui
+                    .add_enabled(
+                        self.installation_query.is_none(),
+                        egui::Button::new("Refresh installation state"),
+                    )
+                    .clicked()
+                {
+                    self.installation_query = Some(crate::live::InstallationQuery::start());
+                }
+            }
         });
     }
 
@@ -739,7 +987,14 @@ impl ControlCenter {
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.heading("Connect a controller");
-            theme::note(ui, "Pair your Wii controller in Linux Bluetooth settings, then find it through the running daemon.");
+            theme::note(
+                ui,
+                if cfg!(windows) {
+                    "Pair your Wii controller in Windows Bluetooth settings, then find it through the running daemon."
+                } else {
+                    "Pair your Wii controller in Linux Bluetooth settings, then find it through the running daemon."
+                },
+            );
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if theme::primary(ui, "Find devices", self.ipc_query.is_none()).clicked() {
@@ -1179,7 +1434,14 @@ impl ControlCenter {
                     ui.add_space(10.0);
                     self.draw_navigation(ui, false);
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        theme::note(ui, "Wii input for Linux");
+                        theme::note(
+                            ui,
+                            if cfg!(windows) {
+                                "Wii input for Windows"
+                            } else {
+                                "Wii input for Linux"
+                            },
+                        );
                         ui.label(
                             egui::RichText::new(format!("WiiLand {}", env!("CARGO_PKG_VERSION")))
                                 .small(),
@@ -1279,14 +1541,24 @@ impl eframe::App for ControlCenter {
         self.poll_command();
         self.poll_service();
         self.poll_validation();
+        #[cfg(windows)]
+        self.poll_installation_query();
         if let Some(result) = self.ipc_query.as_ref().and_then(crate::live::Query::poll) {
-            if result.is_err()
-                && self
-                    .ipc_query
-                    .as_ref()
-                    .is_some_and(crate::live::Query::is_status)
-            {
+            let is_status_query = self
+                .ipc_query
+                .as_ref()
+                .is_some_and(crate::live::Query::is_status);
+            if result.is_err() && is_status_query {
                 self.daemon_status = "Daemon unavailable · see activity log".to_owned();
+            }
+            #[cfg(windows)]
+            if is_status_query {
+                self.service_status = if result.is_ok() {
+                    "Running"
+                } else {
+                    "Unavailable"
+                }
+                .to_owned();
             }
             self.ipc_query = None;
             match result {
@@ -1311,15 +1583,30 @@ impl eframe::App for ControlCenter {
                         ));
                     }
                 }
+                #[cfg(windows)]
+                Ok(QueryResult::Stopped) => {
+                    self.daemon_status = "Daemon stopped".to_owned();
+                    self.service_status = "Stopped".to_owned();
+                }
                 Err(error) => self.model.append_output(&format!("{error}\n")),
             }
         }
         self.draw(ctx);
         let busy = self.config_task.is_some()
             || self.command_task.is_some()
-            || self.service_task.is_some()
+            || self.service_controls_busy()
             || self.validation_task.is_some()
-            || self.ipc_query.is_some();
+            || self.ipc_query.is_some()
+            || {
+                #[cfg(windows)]
+                {
+                    self.installation_query.is_some()
+                }
+                #[cfg(not(windows))]
+                {
+                    false
+                }
+            };
         ctx.request_repaint_after(Duration::from_millis(if busy { 40 } else { 250 }));
     }
 }
@@ -1390,6 +1677,7 @@ fn decode_calibration(bytes: &[u8]) -> Result<CalibrationResult, String> {
     }
 }
 
+#[cfg(unix)]
 fn service_query_status(result: &ProcessResult) -> &'static str {
     match std::str::from_utf8(&result.stdout).map(str::trim) {
         Ok("active") if result.success => "Running",
@@ -1420,7 +1708,7 @@ fn capitalize(value: &str) -> String {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use std::path::PathBuf;
     use std::thread;
@@ -1589,6 +1877,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 #[path = "ui_tests.rs"]
 mod interaction_tests;

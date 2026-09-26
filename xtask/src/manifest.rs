@@ -1,7 +1,12 @@
+#[cfg(unix)]
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -11,6 +16,7 @@ pub struct Features {
     pub integrations: bool,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalDirs {
     pub prefix: PathBuf,
@@ -22,6 +28,7 @@ pub struct LogicalDirs {
     pub mandir: PathBuf,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Default)]
 pub struct LogicalDirOverrides {
     pub prefix: Option<PathBuf>,
@@ -33,6 +40,7 @@ pub struct LogicalDirOverrides {
     pub mandir: Option<PathBuf>,
 }
 
+#[cfg(unix)]
 impl LogicalDirOverrides {
     pub fn resolve(self) -> LogicalDirs {
         let defaults = LogicalDirs::default();
@@ -51,6 +59,7 @@ impl LogicalDirOverrides {
     }
 }
 
+#[cfg(unix)]
 impl Default for LogicalDirs {
     fn default() -> Self {
         let prefix = PathBuf::from("/usr/local");
@@ -67,6 +76,7 @@ impl Default for LogicalDirs {
     }
 }
 
+#[cfg(unix)]
 impl LogicalDirs {
     pub fn validate(&self) -> io::Result<()> {
         for (name, path) in [
@@ -107,6 +117,7 @@ impl LogicalDirs {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OptionalDir {
     Auto,
@@ -114,6 +125,7 @@ pub enum OptionalDir {
     Absolute(PathBuf),
 }
 
+#[cfg(unix)]
 impl OptionalDir {
     pub fn parse(value: &str) -> io::Result<Self> {
         match value {
@@ -167,6 +179,7 @@ impl OptionalDir {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub enum ItemSource {
     Root(PathBuf),
@@ -174,6 +187,7 @@ pub enum ItemSource {
     GeneratedService,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct Item {
     pub source: ItemSource,
@@ -181,6 +195,7 @@ pub struct Item {
     pub mode: u32,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct Manifest {
     pub root: PathBuf,
@@ -191,6 +206,7 @@ pub struct Manifest {
     pub xorg_dir: Option<PathBuf>,
 }
 
+#[cfg(unix)]
 impl Manifest {
     pub fn new(
         root: PathBuf,
@@ -376,6 +392,7 @@ impl Manifest {
     }
 }
 
+#[cfg(unix)]
 fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -390,7 +407,7 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

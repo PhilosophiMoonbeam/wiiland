@@ -10,7 +10,6 @@ use wiiland_core::calibration::CalibrationStats;
 use wiiland_core::mapping;
 use wiiland_core::{Config, Profile, TraceEvent, TraceFilter, TracePayload};
 use wiiland_hid::{EventKind, Interface, InterfaceMask, Monitor, MonitorMode};
-
 #[derive(Debug)]
 pub struct CommandError {
     code: i32,
@@ -64,9 +63,10 @@ pub fn execute(cli: &Cli) -> Result<(), CommandError> {
             print!("{}", cli.config.dump());
             Ok(())
         }
-        Action::CheckConfig => Ok(()),
+        Action::CheckConfig => check_config(&cli.config),
         Action::SelfTest => self_test(),
         Action::CalibrateAim => calibrate_aim(cli),
+        Action::Pair => pair_device_command(cli),
         Action::Run => run_runtime(cli),
     }
 }
@@ -134,6 +134,10 @@ fn runtime_error(code: i32) -> CommandError {
     )
 }
 
+fn device_selector_help() -> &'static str {
+    "pass --device <number|/sys/path>"
+}
+
 fn resolve_run_device_with(
     arg: Option<&str>,
     mut resolve: impl FnMut(&str) -> Option<PathBuf>,
@@ -142,7 +146,10 @@ fn resolve_run_device_with(
         resolve(arg).ok_or_else(|| {
             CommandError::new(
                 libc::ENODEV,
-                "wiilandd: cannot resolve device; run --list and pass --device <number|/sys/path>",
+                format!(
+                    "wiilandd: cannot resolve device; run --list and {}",
+                    device_selector_help()
+                ),
             )
         })
     })
@@ -200,11 +207,14 @@ pub fn resolve_device_arg(arg: &str) -> Option<PathBuf> {
     })
 }
 
+fn is_device_identity(arg: &str) -> bool {
+    arg.starts_with('/')
+}
 fn resolve_device_arg_with(
     arg: &str,
     mut next_device: impl FnMut() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if arg.starts_with('/') {
+    if is_device_identity(arg) {
         return Some(PathBuf::from(arg));
     }
     let number = arg.parse::<usize>().ok().filter(|n| *n != 0)?;
@@ -218,8 +228,20 @@ fn resolve_device_arg_with(
 }
 
 fn calibrate_aim(cli: &Cli) -> Result<(), CommandError> {
-    let path = cli.device.as_deref().and_then(resolve_device_arg).or_else(|| resolve_device_arg("1"))
-        .ok_or_else(|| CommandError::new(libc::ENODEV, "wiilandd: cannot resolve calibration device; run --list and pass --device <number|/sys/path>"))?;
+    let path = cli
+        .device
+        .as_deref()
+        .and_then(resolve_device_arg)
+        .or_else(|| resolve_device_arg("1"))
+        .ok_or_else(|| {
+            CommandError::new(
+                libc::ENODEV,
+                format!(
+                    "wiilandd: cannot resolve calibration device; run --list and {}",
+                    device_selector_help()
+                ),
+            )
+        })?;
     let mut iface = Interface::new(&path).map_err(|e| {
         CommandError::new(
             io_errno(&e).unsigned_abs() as i32,
@@ -499,13 +521,25 @@ fn user_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(base).join("wiiland/wiilandd.conf"))
 }
 
+fn check_config(_config: &Config) -> Result<(), CommandError> {
+    Ok(())
+}
+
 const AXIS_MAP: &str = "range.signed=-32768:32767\nrange.trigger=0:1023\nrange.balance=0:65535\nwiimote.dpad.left=BTN_DPAD_LEFT\nwiimote.dpad.right=BTN_DPAD_RIGHT\nwiimote.dpad.up=BTN_DPAD_UP\nwiimote.dpad.down=BTN_DPAD_DOWN\nwiimote.a=BTN_SOUTH\nwiimote.b=BTN_EAST\nwiimote.plus=BTN_START\nwiimote.minus=BTN_SELECT\nwiimote.home=BTN_MODE\nwiimote.one=BTN_1\nwiimote.two=BTN_2\nwiimote.accel.x=ABS_THROTTLE\nwiimote.accel.y=ABS_RUDDER\nwiimote.accel.z=ABS_WHEEL\nnunchuk.stick.x=ABS_X\nnunchuk.stick.y=ABS_Y\nnunchuk.accel.x=ABS_HAT1X\nnunchuk.accel.y=ABS_HAT1Y\nnunchuk.accel.z=ABS_HAT2X\nnunchuk.c=BTN_C\nnunchuk.z=BTN_Z\nmotion-plus.x=ABS_GAS\nmotion-plus.y=ABS_BRAKE\nmotion-plus.z=ABS_HAT0X\nclassic.left-stick.x=ABS_X\nclassic.left-stick.y=ABS_Y\naim.right-stick.x=ABS_RX\naim.right-stick.y=ABS_RY\naim.mouse.x=REL_X\naim.mouse.y=REL_Y\nclassic.right-stick.x=ABS_RX\nclassic.right-stick.y=ABS_RY\nclassic.trigger.left=ABS_Z\nclassic.trigger.right=ABS_RZ\nclassic.dpad.left=BTN_DPAD_LEFT\nclassic.dpad.right=BTN_DPAD_RIGHT\nclassic.dpad.up=BTN_DPAD_UP\nclassic.dpad.down=BTN_DPAD_DOWN\nclassic.a=BTN_SOUTH\nclassic.b=BTN_EAST\nclassic.x=BTN_NORTH\nclassic.y=BTN_WEST\nclassic.plus=BTN_START\nclassic.minus=BTN_SELECT\nclassic.home=BTN_MODE\nclassic.tl=BTN_TL\nclassic.tr=BTN_TR\nclassic.zl=BTN_TL2\nclassic.zr=BTN_TR2\npro.left-stick.x=ABS_X\npro.left-stick.y=ABS_Y\npro.right-stick.x=ABS_RX\npro.right-stick.y=ABS_RY\npro.zl=BTN_TL2\npro.zr=BTN_TR2\npro.dpad.left=BTN_DPAD_LEFT\npro.dpad.right=BTN_DPAD_RIGHT\npro.dpad.up=BTN_DPAD_UP\npro.dpad.down=BTN_DPAD_DOWN\npro.a=BTN_SOUTH\npro.b=BTN_EAST\npro.x=BTN_NORTH\npro.y=BTN_WEST\npro.plus=BTN_START\npro.minus=BTN_SELECT\npro.home=BTN_MODE\npro.tl=BTN_TL\npro.tr=BTN_TR\npro.thumbl=BTN_THUMBL\npro.thumbr=BTN_THUMBR\nguitar.stick.x=ABS_X\nguitar.stick.y=ABS_Y\nguitar.whammy=ABS_HAT3X\nguitar.fret-board=ABS_HAT3Y\nguitar.strum.up=BTN_STRUM_BAR_UP\nguitar.strum.down=BTN_STRUM_BAR_DOWN\nguitar.plus=BTN_START\nguitar.minus=BTN_SELECT\nguitar.fret.far-up=BTN_FRET_FAR_UP\nguitar.fret.up=BTN_FRET_UP\nguitar.fret.mid=BTN_FRET_MID\nguitar.fret.low=BTN_FRET_LOW\nguitar.fret.far-low=BTN_FRET_FAR_LOW\ndrums.pad.x=ABS_X\ndrums.pad.y=ABS_Y\ndrums.cymbal.left=ABS_RX\ndrums.cymbal.right=ABS_RY\ndrums.tom.left=ABS_Z\ndrums.tom.right=ABS_RZ\ndrums.tom.far-right=ABS_HAT3X\ndrums.bass=ABS_HAT3Y\ndrums.hi-hat=ABS_MISC\ndrums.plus=BTN_START\ndrums.minus=BTN_SELECT\nbalance.top-right=ABS_PRESSURE\nbalance.bottom-right=ABS_DISTANCE\nbalance.top-left=ABS_TILT_X\nbalance.bottom-left=ABS_TILT_Y\n";
 const VALIDATION: &str = "original.core-buttons=required\noriginal.accelerometer=required\noriginal.ir-desktop-pointer=required\nmotion-plus-external.hotplug=required\nmotion-plus-external.axes=required\nmotion-plus-builtin.axes=required\nnunchuk.stick=required\nnunchuk.buttons=required\nnunchuk.accelerometer=required\nclassic.sticks=required\nclassic.triggers=required\nclassic.buttons=required\npro.sticks=required\npro.triggers=required\npro.buttons=required\nguitar.frets=required\nguitar.strum=required\nguitar.whammy=required\nguitar.stick=required\ndrums.pads=required\ndrums.cymbals-toms=required\ndrums.pedals=required\nbalance-board.sensors=required\nwayland.sdl=required\nwayland.wine-proton=required\nwayland.desktop-profile=required\nsteam.motion-aim-right-stick=required\nsteam.motion-aim-mouse=required\nnonsteam.motion-aim-right-stick=required\nnonsteam.motion-aim-mouse=required\n";
 fn print_axis_map() {
     print!("{}", AXIS_MAP);
 }
+
 fn print_validation_checklist() {
     print!("{}", VALIDATION);
+}
+
+fn pair_device_command(_cli: &Cli) -> Result<(), CommandError> {
+    Err(CommandError::new(
+        libc::EINVAL,
+        "wiilandd: Bluetooth pairing is available only on Windows",
+    ))
 }
 
 fn self_test() -> Result<(), CommandError> {

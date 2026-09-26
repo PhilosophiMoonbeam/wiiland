@@ -1,11 +1,15 @@
 //! Per-connection framing, subscriptions, and bounded output.
-use super::{FRAME_BUDGET, MAX_QUEUED_BYTES, READ_BUDGET, READ_CHUNK, WRITE_BUDGET};
-use std::{
-    collections::VecDeque,
-    io::{self, Read, Write},
-    os::unix::net::UnixStream,
-    path::Path,
-};
+use super::{FRAME_BUDGET, MAX_QUEUED_BYTES};
+#[cfg(unix)]
+use super::{READ_BUDGET, READ_CHUNK, WRITE_BUDGET};
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use wiiland_ipc::{
     Command, DeviceInfo, FrameBuffer, Notification, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError,
     ProtocolErrorCode, Request, ResponseResult, ServerMessage, Status, Subscription, encode_frame,
@@ -18,6 +22,7 @@ pub(super) struct Pending {
 
 #[derive(Debug)]
 pub(super) struct Client {
+    #[cfg(unix)]
     pub(super) stream: UnixStream,
     pub(super) frames: FrameBuffer,
     pub(super) pending_frames: VecDeque<Vec<u8>>,
@@ -29,10 +34,13 @@ pub(super) struct Client {
     pub(super) input: bool,
     pub(super) devices: bool,
     pub(super) commands: VecDeque<(u64, Command)>,
+    #[cfg(windows)]
+    pub(super) continuation_queued: bool,
     pub(super) capture: Vec<String>,
 }
 
 impl Client {
+    #[cfg(unix)]
     pub(super) fn new(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -46,6 +54,24 @@ impl Client {
             input: false,
             devices: false,
             commands: VecDeque::new(),
+            capture: Vec::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn new() -> Self {
+        Self {
+            frames: FrameBuffer::new(),
+            pending_frames: VecDeque::new(),
+            output: VecDeque::new(),
+            queued_bytes: 0,
+            negotiated: false,
+            immediate_close: false,
+            closing: false,
+            input: false,
+            devices: false,
+            commands: VecDeque::new(),
+            continuation_queued: false,
             capture: Vec::new(),
         }
     }
@@ -90,6 +116,7 @@ impl Client {
         true
     }
 
+    #[cfg(unix)]
     pub(super) fn write_ready(&mut self) -> bool {
         let mut budget = WRITE_BUDGET;
         while budget != 0 {
@@ -119,10 +146,34 @@ impl Client {
         }
         true
     }
+    #[cfg(windows)]
+    pub(super) fn next_write(&self, limit: usize) -> Option<&[u8]> {
+        let front = self.output.front()?;
+        let remaining = &front.bytes[front.offset..];
+        Some(&remaining[..remaining.len().min(limit)])
+    }
+
+    #[cfg(windows)]
+    pub(super) fn consume_written(&mut self, written: usize) -> bool {
+        let Some(front) = self.output.front_mut() else {
+            return written == 0;
+        };
+        let remaining = front.bytes.len().saturating_sub(front.offset);
+        if written > remaining {
+            return false;
+        }
+        front.offset += written;
+        self.queued_bytes = self.queued_bytes.saturating_sub(written);
+        if front.offset == front.bytes.len() {
+            self.output.pop_front();
+        }
+        true
+    }
 }
 
 /// Single-threaded, nonblocking Unix-socket IPC server.
 ///
+#[cfg(unix)]
 pub(super) fn read_client(
     client: &mut Client,
     socket_path: &Path,
@@ -173,6 +224,26 @@ pub(super) fn read_client(
     true
 }
 
+#[cfg(windows)]
+pub(super) fn read_bytes(
+    client: &mut Client,
+    bytes: &[u8],
+    socket_path: &Path,
+    status: &mut dyn FnMut(&Path) -> Status,
+    devices: &mut dyn FnMut() -> Vec<DeviceInfo>,
+) -> bool {
+    let frames = match client.frames.push(bytes) {
+        Ok(frames) => frames,
+        Err(error) => {
+            client.closing = true;
+            let _ = client.queue(&ServerMessage::Error { id: None, error });
+            return true;
+        }
+    };
+    client.pending_frames.extend(frames);
+    let mut budget = FRAME_BUDGET;
+    process_pending(client, socket_path, status, devices, &mut budget)
+}
 pub(super) fn process_pending(
     client: &mut Client,
     socket_path: &Path,

@@ -1,4 +1,5 @@
 //! Direct Linux uinput output with deterministic backend seams.
+#![cfg(target_os = "linux")]
 use std::io;
 use std::mem::size_of;
 use std::os::fd::RawFd;

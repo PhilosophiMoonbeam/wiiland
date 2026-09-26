@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
-description = "Native Rust support for Wii controllers exposed by Linux hid-wiimote"
+description = "Native Rust support for Wii Remote HID devices on Linux and Windows"
 
 [lib]
 name = "wiiland_hid"
@@ -12,3 +12,15 @@ name = "wiiland_hid"
 [dependencies]
 libc.workspace = true
 wiiland-core = { path = "../wiiland-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Bluetooth",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

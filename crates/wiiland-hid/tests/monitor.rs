@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
 

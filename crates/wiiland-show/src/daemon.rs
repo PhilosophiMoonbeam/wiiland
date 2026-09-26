@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     time::Duration,
 };
@@ -48,16 +48,9 @@ pub fn run(program: &str, selector: &str, socket: Option<PathBuf>) -> i32 {
         let path = devices[0].syspath.clone();
         println!("Using Wii Remote: {path}");
         io::stdout().flush()?;
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0
-            || unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0
-        {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(io::Error::other(
                 "interactive UI requires a terminal on stdin and stdout",
-            ));
-        }
-        if !std::env::var("TERM").is_ok_and(|term| !term.is_empty() && term != "dumb") {
-            return Err(io::Error::other(
-                "interactive UI requires a usable TERM value",
             ));
         }
         let _guard = TerminalGuard::enter()?;

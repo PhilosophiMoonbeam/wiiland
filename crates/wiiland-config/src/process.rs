@@ -1,5 +1,8 @@
-use std::io::Read;
+use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -28,8 +31,11 @@ pub enum ProcessEvent {
 struct ChildState {
     child: Option<Child>,
     terminate_requested: bool,
+    #[cfg(windows)]
+    readers_stopped: bool,
 }
 
+#[cfg(all(test, target_os = "linux"))]
 #[derive(Debug)]
 struct SpawnGate {
     spawned: SyncSender<u32>,
@@ -66,18 +72,30 @@ impl ProcessResult {
 
 impl ProcessTask {
     pub fn spawn(program: impl Into<String>, args: &[String]) -> Self {
-        Self::spawn_inner(program.into(), args.to_vec(), None, None)
+        Self::spawn_inner(
+            program.into(),
+            args.to_vec(),
+            None,
+            #[cfg(all(test, target_os = "linux"))]
+            None,
+        )
     }
 
     pub fn spawn_capturing_stdout(program: impl Into<String>, args: &[String]) -> Self {
-        Self::spawn_inner(program.into(), args.to_vec(), Some(CAPTURE_LIMIT), None)
+        Self::spawn_inner(
+            program.into(),
+            args.to_vec(),
+            Some(CAPTURE_LIMIT),
+            #[cfg(all(test, target_os = "linux"))]
+            None,
+        )
     }
 
     fn spawn_inner(
         program: String,
         args: Vec<String>,
         stdout_capture_limit: Option<usize>,
-        gate: Option<SpawnGate>,
+        #[cfg(all(test, target_os = "linux"))] gate: Option<SpawnGate>,
     ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let state = Arc::new(Mutex::new(ChildState::default()));
@@ -98,6 +116,7 @@ impl ProcessTask {
                 }
             };
 
+            #[cfg(all(test, target_os = "linux"))]
             if let Some(gate) = gate {
                 let _ = gate.spawned.send(child.id());
                 let _ = gate.publish.recv();
@@ -163,6 +182,8 @@ impl ProcessTask {
                 }
                 thread::sleep(Duration::from_millis(10));
             };
+            #[cfg(windows)]
+            stop_readers(&child_state);
 
             let stdout = stdout_thread
                 .and_then(|reader| reader.join().ok())
@@ -217,7 +238,7 @@ impl ProcessTask {
         request_termination(&self.state);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn spawn_paused_before_publication(
         program: impl Into<String>,
         args: &[String],
@@ -256,8 +277,112 @@ struct ReaderResult {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeReadiness {
+    Ready(usize),
+    Pending,
+    #[cfg(windows)]
+    Closed,
+    #[cfg(unix)]
+    Invalid,
+}
+
+trait PipeRead: Read {
+    fn readiness(&self) -> io::Result<PipeReadiness>;
+}
+
+#[cfg(unix)]
+impl<T: Read + AsFd> PipeRead for T {
+    fn readiness(&self) -> io::Result<PipeReadiness> {
+        let mut descriptor = libc::pollfd {
+            fd: self.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd and its borrowed
+        // descriptor remains owned by self throughout this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, PIPE_POLL_TIMEOUT_MS) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ready == 0 {
+            return Ok(PipeReadiness::Pending);
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Ok(PipeReadiness::Invalid);
+        }
+        Ok(PipeReadiness::Ready(READ_CHUNK_SIZE))
+    }
+}
+
+#[cfg(windows)]
+impl<T: Read + AsRawHandle> PipeRead for T {
+    fn readiness(&self) -> io::Result<PipeReadiness> {
+        let mut available = 0;
+        // SAFETY: this handle is borrowed from self; null optional buffers and
+        // zero buffer size request only the number of bytes available.
+        let succeeded = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                self.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if succeeded != 0 {
+            return Ok(if available > 0 {
+                PipeReadiness::Ready(available as usize)
+            } else {
+                PipeReadiness::Pending
+            });
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32) {
+            Ok(PipeReadiness::Closed)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn stop_readers(state: &Mutex<ChildState>) {
+    lock_state(state).readers_stopped = true;
+}
+
+fn send_output_event(
+    sender: &SyncSender<ProcessEvent>,
+    event: ProcessEvent,
+    state: &Mutex<ChildState>,
+) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = state;
+        sender.send(event).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        let mut event = event;
+        loop {
+            if lock_state(state).terminate_requested {
+                return false;
+            }
+            match sender.try_send(event) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    event = returned;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    }
+}
+
 fn read_stream(
-    mut stream: impl Read + AsFd,
+    mut stream: impl PipeRead,
     output_stream: OutputStream,
     sender: SyncSender<ProcessEvent>,
     capture_limit: Option<usize>,
@@ -266,65 +391,84 @@ fn read_stream(
     let mut result = ReaderResult::default();
     let mut buffer = [0_u8; READ_CHUNK_SIZE];
     loop {
-        if lock_state(state).terminate_requested {
-            break;
-        }
-        // A descendant can inherit stdout/stderr after our direct child exits.
-        // Poll before reading so cancellation does not depend on that descendant
-        // writing again or closing its descriptors. This is the only reader.
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: descriptor points to one initialized pollfd and its borrowed
-        // descriptor remains owned by stream throughout this call.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, PIPE_POLL_TIMEOUT_MS) };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            result.error = Some(format!("failed to poll {output_stream:?}: {error}"));
-            break;
-        }
-        if ready == 0 {
-            continue;
-        }
-        if descriptor.revents & libc::POLLNVAL != 0 {
-            result.error = Some(format!("invalid {output_stream:?} descriptor"));
-            break;
-        }
-        if lock_state(state).terminate_requested {
-            break;
-        }
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(length) => {
-                if let Some(limit) = capture_limit {
-                    let remaining = limit.saturating_sub(result.captured.len());
-                    result
-                        .captured
-                        .extend_from_slice(&buffer[..length.min(remaining)]);
-                    if length > remaining && result.error.is_none() {
-                        result.error = Some(format!(
-                            "{output_stream:?} exceeded the {CAPTURE_LIMIT}-byte capture limit"
-                        ));
-                    }
+        let (terminate_requested, readers_stopped) = {
+            let state = lock_state(state);
+            (state.terminate_requested, {
+                #[cfg(windows)]
+                {
+                    state.readers_stopped
                 }
-                let event = match output_stream {
-                    OutputStream::Stdout => ProcessEvent::Stdout(buffer[..length].to_vec()),
-                    OutputStream::Stderr => ProcessEvent::Stderr(buffer[..length].to_vec()),
-                };
-                if sender.send(event).is_err() {
+                #[cfg(unix)]
+                {
+                    false
+                }
+            })
+        };
+        if terminate_requested {
+            break;
+        }
+        // Poll before reading so cancellation never waits for another write or
+        // EOF. Windows peeks anonymous pipes; Unix polls the borrowed fd.
+        let readiness = match stream.readiness() {
+            Ok(readiness) => readiness,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                result.error = Some(format!("failed to poll {output_stream:?}: {error}"));
+                break;
+            }
+        };
+        let available = match readiness {
+            #[cfg(windows)]
+            PipeReadiness::Closed => break,
+            #[cfg(unix)]
+            PipeReadiness::Invalid => {
+                result.error = Some(format!("invalid {output_stream:?} descriptor"));
+                break;
+            }
+            PipeReadiness::Pending => {
+                // On Windows, once the direct child exits, drain bytes already
+                // in the pipe but stop waiting for descendants that inherited it.
+                if readers_stopped {
                     break;
                 }
+                #[cfg(windows)]
+                thread::sleep(Duration::from_millis(PIPE_POLL_TIMEOUT_MS as u64));
+                continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            PipeReadiness::Ready(available) => available,
+        };
+        if lock_state(state).terminate_requested {
+            break;
+        }
+        // Windows reads only the bytes observed by PeekNamedPipe. A larger
+        // synchronous ReadFile can wait for a still-in-progress pipe write.
+        let requested = available.min(buffer.len());
+        let length = match stream.read(&mut buffer[..requested]) {
+            Ok(0) => break,
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 result.error = Some(format!("failed to read {output_stream:?}: {error}"));
                 break;
             }
+        };
+        if let Some(limit) = capture_limit {
+            let remaining = limit.saturating_sub(result.captured.len());
+            result
+                .captured
+                .extend_from_slice(&buffer[..length.min(remaining)]);
+            if length > remaining && result.error.is_none() {
+                result.error = Some(format!(
+                    "{output_stream:?} exceeded the {CAPTURE_LIMIT}-byte capture limit"
+                ));
+            }
+        }
+        let event = match output_stream {
+            OutputStream::Stdout => ProcessEvent::Stdout(buffer[..length].to_vec()),
+            OutputStream::Stderr => ProcessEvent::Stderr(buffer[..length].to_vec()),
+        };
+        if !send_output_event(&sender, event, state) {
+            break;
         }
     }
     result
@@ -344,6 +488,7 @@ fn request_termination(state: &Mutex<ChildState>) {
     }
 }
 
+#[cfg(unix)]
 pub fn service_args(action: &str) -> Vec<String> {
     vec![
         "--user".to_owned(),
@@ -380,7 +525,7 @@ pub fn configured_args(
     args
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::io::Write;
     use std::os::fd::FromRawFd;

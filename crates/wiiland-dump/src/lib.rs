@@ -7,8 +7,16 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{IntoRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::IntoRawHandle;
 use std::path::Path;
+
+#[cfg(windows)]
+const FALLBACK_READ_ERROR_CODE: i32 = windows_sys::Win32::Foundation::ERROR_GEN_FAILURE as i32;
+#[cfg(not(windows))]
+const FALLBACK_READ_ERROR_CODE: i32 = libc::EIO;
 
 /// Number of bytes in one displayed EEPROM record.
 pub const RECORD_SIZE: usize = 8;
@@ -35,16 +43,16 @@ pub fn read_retry<R: Read>(reader: &mut R, buffer: &mut [u8]) -> io::Result<usiz
     }
 }
 
-/// Return an errno description in the form used by `strerror(3)`.
+/// Return an OS error description without Rust's appended `(os error N)`.
 ///
-/// Rust's `io::Error` display adds ` (os error N)` to platform errors, while
-/// the historical EEPROM dump utility prints only the libc description.
+/// Rust's `io::Error` display adds the raw OS code, while the historical EEPROM
+/// dump utility prints only the platform description.
 pub fn error_description(error: &io::Error) -> String {
     let text = error.to_string();
-    let Some(errno) = error.raw_os_error() else {
+    let Some(error_code) = error.raw_os_error() else {
         return text;
     };
-    let suffix = format!(" (os error {errno})");
+    let suffix = format!(" (os error {error_code})");
     text.strip_suffix(&suffix)
         .map_or_else(|| text.clone(), str::to_owned)
 }
@@ -88,11 +96,11 @@ pub fn dump<R: Read, O: Write, E: Write>(
                     return Ok(true);
                 }
                 Err(error) => error,
-                Ok(_) => io::Error::from_raw_os_error(libc::EIO),
+                Ok(_) => io::Error::from_raw_os_error(FALLBACK_READ_ERROR_CODE),
             };
 
-            let errno = error.raw_os_error().unwrap_or(libc::EIO);
-            write!(stdout, " (read error {errno})")?;
+            let error_code = error.raw_os_error().unwrap_or(FALLBACK_READ_ERROR_CODE);
+            write!(stdout, " (read error {error_code})")?;
             writeln!(
                 stderr,
                 "Cannot read eeprom file '{file}' at offset 0x{offset:08x}: {}",
@@ -116,9 +124,7 @@ pub fn open_eeprom(path: &Path) -> io::Result<File> {
 }
 
 /// Close an EEPROM file and preserve close errors for the CLI diagnostic.
-///
-/// `File`'s destructor cannot report `close(2)` failures, so ownership is
-/// transferred to the raw descriptor and closed explicitly on Linux.
+#[cfg(unix)]
 pub fn close_eeprom(file: File) -> io::Result<()> {
     let descriptor: RawFd = file.into_raw_fd();
     // SAFETY: `descriptor` was just transferred from a live `File`, and this
@@ -128,6 +134,21 @@ pub fn close_eeprom(file: File) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// Close an EEPROM file and preserve close errors for the CLI diagnostic.
+#[cfg(windows)]
+pub fn close_eeprom(file: File) -> io::Result<()> {
+    let handle = file.into_raw_handle();
+    // SAFETY: `handle` was just transferred from a live `File`, and this
+    // function is the sole owner responsible for closing it.
+    let result = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+    if result != 0 {
+        Ok(())
+    } else {
+        let error_code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        Err(io::Error::from_raw_os_error(error_code as i32))
     }
 }
 
@@ -218,17 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn read_error_reports_errno_and_offset() {
+    fn read_error_reports_error_code_and_offset() {
         let mut input = FailsAfterOne { first: true };
         let mut output = Vec::new();
         let mut errors = Vec::new();
+        let read_error = io::Error::from_raw_os_error(libc::EIO);
+        let description = super::error_description(&read_error);
 
         assert!(!dump(&mut input, &mut output, &mut errors, "broken").unwrap());
         assert_eq!(output, b"0x00000000: 0x7f (read error 5)");
-        assert_eq!(
-            errors,
-            b"Cannot read eeprom file 'broken' at offset 0x00000001: Input/output error\n"
-        );
+        let expected =
+            format!("Cannot read eeprom file 'broken' at offset 0x00000001: {description}\n");
+        assert_eq!(errors, expected.as_bytes());
     }
 
     #[test]

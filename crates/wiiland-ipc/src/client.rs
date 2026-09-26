@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::env;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -9,6 +11,11 @@ use crate::{
     Command, DeviceInfo, FrameBuffer, FrameError, Notification, PROTOCOL_MAJOR, ProtocolError,
     Request, ResponseResult, ServerMessage, Status, Subscription, decode_frame, encode_frame,
 };
+
+#[cfg(unix)]
+type ClientStream = UnixStream;
+#[cfg(windows)]
+type ClientStream = crate::windows_transport::WindowsPipe;
 
 const MAX_NOTIFICATION_BACKLOG_BYTES: usize = 256 * 1024;
 
@@ -100,9 +107,9 @@ impl From<FrameError> for ClientError {
     }
 }
 
-/// A blocking client for the wiiland daemon's Unix socket protocol.
+/// A blocking client for the wiiland daemon's platform IPC protocol.
 pub struct Client {
-    stream: UnixStream,
+    stream: ClientStream,
     socket_path: PathBuf,
     frames: FrameBuffer,
     notifications: VecDeque<(Notification, usize)>,
@@ -115,9 +122,32 @@ pub struct Client {
 
 impl Client {
     /// Connect to `path` and negotiate the protocol version.
+    ///
+    /// On Windows, `path` must be the named-pipe endpoint for the current
+    /// logon session, as returned by [`Self::default_socket_path`].
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = path.as_ref().to_path_buf();
+        #[cfg(unix)]
         let stream = UnixStream::connect(&path)?;
+        #[cfg(windows)]
+        let stream = crate::windows_transport::WindowsPipe::connect(&path)?;
+        Self::finish_connect(path, stream)
+    }
+
+    #[cfg(unix)]
+    /// Connect using the platform's default daemon endpoint.
+    pub fn connect_default() -> Result<Self, ClientError> {
+        Self::connect(default_socket_path()?)
+    }
+
+    #[cfg(windows)]
+    /// Connect using the platform's default daemon endpoint.
+    pub fn connect_default() -> Result<Self, ClientError> {
+        let (path, stream) = crate::windows_transport::WindowsPipe::connect_default()?;
+        Self::finish_connect(path, stream)
+    }
+
+    fn finish_connect(path: PathBuf, stream: ClientStream) -> Result<Self, ClientError> {
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let mut client = Self {
@@ -137,12 +167,7 @@ impl Client {
         Ok(client)
     }
 
-    /// Connect using `$XDG_RUNTIME_DIR/wiiland/wiilandd.sock`.
-    pub fn connect_default() -> Result<Self, ClientError> {
-        Self::connect(default_socket_path()?)
-    }
-
-    /// Return the default daemon socket path.
+    /// Return the default daemon endpoint path.
     pub fn default_socket_path() -> Result<PathBuf, ClientError> {
         default_socket_path()
     }
@@ -152,14 +177,14 @@ impl Client {
         &self.socket_path
     }
 
-    /// Set the read timeout for subsequent socket reads.
+    /// Set the read timeout for subsequent transport reads.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), ClientError> {
         self.stream
             .set_read_timeout(timeout)
             .map_err(ClientError::Io)
     }
 
-    /// Set the write timeout for subsequent socket writes.
+    /// Set the write timeout for subsequent transport writes.
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), ClientError> {
         self.stream
             .set_write_timeout(timeout)
@@ -463,7 +488,8 @@ fn map_stream_io_error(error: io::Error) -> ClientError {
     }
 }
 
-/// Return the default daemon socket path.
+/// Return the default daemon endpoint path.
+#[cfg(unix)]
 pub fn default_socket_path() -> Result<PathBuf, ClientError> {
     let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(ClientError::RuntimeDirectoryMissing)?;
     let runtime = PathBuf::from(runtime);
@@ -473,7 +499,13 @@ pub fn default_socket_path() -> Result<PathBuf, ClientError> {
     Ok(runtime.join("wiiland").join("wiilandd.sock"))
 }
 
-#[cfg(test)]
+/// Return the default daemon endpoint path.
+#[cfg(windows)]
+pub fn default_socket_path() -> Result<PathBuf, ClientError> {
+    crate::windows_transport::default_pipe_path().map_err(ClientError::Io)
+}
+
+#[cfg(all(test, unix))]
 mod deadline_tests {
     use super::*;
     use std::io::{BufRead, BufReader};

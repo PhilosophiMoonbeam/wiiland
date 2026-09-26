@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

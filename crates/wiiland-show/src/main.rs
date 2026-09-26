@@ -3,27 +3,40 @@ mod daemon;
 mod render;
 
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+#[cfg(windows)]
+use wiiland_hid::MonitorPoll;
 use wiiland_hid::{Interface, Monitor, MonitorMode};
 
 use app::{Action, App, Selector, parse_selector, poll_interface};
 
 const UI_HELP: &str = "UI commands:\n  q: Quit application\n  f: Freeze/Unfreeze screen\n  s: Refresh static values and recalibrate MotionPlus\n  k: Toggle key events\n  r: Toggle rumble motor (when writable)\n  a: Toggle accelerometer\n  i: Toggle IR camera\n  m: Toggle motion plus\n  n: Toggle normalization for motion plus\n  N: Toggle Nunchuk\n  c: Toggle Classic Controller\n  b: Toggle balance board\n  p: Toggle pro controller\n  g: Toggle guitar controller\n  d: Toggle drums controller\n  1-4: Toggle LEDs (when writable)\n";
 
+#[cfg(windows)]
+const SELECTOR_HELP: &str = "<opaque-Windows-HID-device-ID>";
+#[cfg(not(windows))]
+const SELECTOR_HELP: &str = "/sys/path/to/device";
+
 fn write_help(mut output: impl Write, program: &str) {
     let _ = write!(
         output,
-        "Usage:\n  {program} -h|--help\n  {program} list\n  {program} <positive-ordinal>\n  {program} /sys/path/to/device\nOptions:\n  --direct  Own hardware directly (stop wiilandd first)\n  --socket PATH  Use an explicit daemon socket\nDefault: observe the running daemon; q/f are available.\nDirect hardware UI commands:\n{UI_HELP}"
+        "Usage:\n  {program} -h|--help\n  {program} list\n  {program} <positive-ordinal>\n  {program} {SELECTOR_HELP}\nOptions:\n  --direct  Own hardware directly (stop wiilandd first)\n  --socket PATH  Use an explicit daemon socket\nDefault: observe the running daemon; q/f are available.\nDirect hardware UI commands:\n{UI_HELP}"
     );
 }
 
@@ -109,25 +122,18 @@ where
         }
     };
     let shown = iface.syspath().to_string_lossy().into_owned();
-    // This line intentionally precedes every terminal guard, including TTY and TERM checks.
+    // This line intentionally precedes every terminal guard.
     println!("Using Wii Remote: {shown}");
     let _ = io::stdout().flush();
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 0 {
+    if !io::stdin().is_terminal() {
         eprintln!(
             "{program}: interactive UI requires a terminal on stdin; use '{program} list' for pipelines"
         );
         return 1;
     }
-    if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
+    if !io::stdout().is_terminal() {
         eprintln!(
             "{program}: interactive UI requires a terminal on stdout; use '{program} list' for redirected output"
-        );
-        return 1;
-    }
-    let term = env::var("TERM").unwrap_or_default();
-    if term.is_empty() || term == "dumb" {
-        eprintln!(
-            "{program}: interactive UI requires a usable TERM value (for example, TERM=xterm-256color)"
         );
         return 1;
     }
@@ -239,27 +245,16 @@ fn interactive(iface: &mut Interface) -> io::Result<()> {
     let mut monitor = match Monitor::new(MonitorMode::Watch) {
         Ok(monitor) => Some(monitor),
         Err(error) => {
-            app.error(format!(
-                "Cannot initialize hotplug watch descriptor: {error}"
-            ));
+            app.error(format!("Cannot initialize hotplug monitor: {error}"));
             None
         }
     };
     loop {
         terminal.draw(|frame| render::render(frame, &app))?;
-        wait_fd(Some(iface.as_fd()), 50)?;
+        wait_interface(iface, 50)?;
         while poll_interface(iface, &mut app)? {}
-        if monitor
-            .as_ref()
-            .is_some_and(|monitor| monitor.fd().is_some())
-        {
-            wait_fd(monitor.as_ref().and_then(Monitor::fd), 0)?;
-            if let Some(monitor) = monitor.as_mut() {
-                while monitor.poll()?.is_some() {
-                    app.info("Watch event");
-                    app.open_available(iface);
-                }
-            }
+        if let Some(monitor) = monitor.as_mut() {
+            poll_monitor(monitor, iface, &mut app)?;
         }
         while event::poll(Duration::ZERO)? {
             match event::read()? {
@@ -282,6 +277,44 @@ fn interactive(iface: &mut Interface) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn wait_interface(iface: &Interface, timeout_ms: u32) -> io::Result<()> {
+    wait_fd(Some(iface.as_fd()), timeout_ms as i32)
+}
+
+#[cfg(windows)]
+fn wait_interface(iface: &Interface, timeout_ms: u32) -> io::Result<()> {
+    match unsafe { WaitForSingleObject(iface.wait_handle(), timeout_ms) } {
+        WAIT_OBJECT_0 | WAIT_TIMEOUT => Ok(()),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        result => Err(io::Error::other(format!(
+            "WaitForSingleObject returned 0x{result:08x}"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn poll_monitor(monitor: &mut Monitor, iface: &mut Interface, app: &mut App) -> io::Result<()> {
+    if monitor.fd().is_some() {
+        wait_fd(monitor.fd(), 0)?;
+        while monitor.poll()?.is_some() {
+            app.info("Watch event");
+            app.open_available(iface);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn poll_monitor(monitor: &mut Monitor, iface: &mut Interface, app: &mut App) -> io::Result<()> {
+    if let MonitorPoll::Path(_) = monitor.poll_bounded(64)? {
+        app.info("Watch event");
+        app.open_available(iface);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn wait_fd(fd: Option<BorrowedFd<'_>>, timeout_ms: i32) -> io::Result<()> {
     let Some(fd) = fd else {
         std::thread::sleep(Duration::from_millis(timeout_ms as u64));

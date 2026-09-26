@@ -1,12 +1,16 @@
 mod dist;
+#[cfg(unix)]
 mod install;
 mod manifest;
 
+#[cfg(unix)]
 use install::{InstallOptions, install, uninstall};
-use manifest::{Features, LogicalDirOverrides, LogicalDirs, Manifest, OptionalDir};
+use manifest::Features;
+#[cfg(unix)]
+use manifest::{LogicalDirOverrides, LogicalDirs, Manifest, OptionalDir};
 use std::env;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
 
 #[derive(Debug)]
@@ -18,6 +22,7 @@ enum Command {
     Check {
         all_features: bool,
     },
+    #[cfg(unix)]
     Install {
         options: InstallOptions,
         dirs: LogicalDirs,
@@ -26,6 +31,7 @@ enum Command {
         systemd: OptionalDir,
         xorg: OptionalDir,
     },
+    #[cfg(unix)]
     Uninstall {
         destdir: PathBuf,
         dirs: LogicalDirs,
@@ -113,6 +119,7 @@ fn parse(args: &[String]) -> io::Result<Command> {
                 Ok(Command::Check { all_features })
             }
         }
+        #[cfg(unix)]
         "install" => {
             let mut dir_overrides = LogicalDirOverrides::default();
             let mut features = Features {
@@ -197,6 +204,7 @@ fn parse(args: &[String]) -> io::Result<Command> {
                 xorg,
             })
         }
+        #[cfg(unix)]
         "uninstall" => {
             let mut destdir = PathBuf::new();
             let mut dir_overrides = LogicalDirOverrides::default();
@@ -328,7 +336,18 @@ fn run_cargo(command: &str, release: bool) -> io::Result<()> {
 }
 
 fn main_result() -> io::Result<()> {
-    let command = parse(&env::args().skip(1).collect::<Vec<_>>())?;
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(not(unix))]
+    if matches!(
+        args.first().map(String::as_str),
+        Some("install" | "uninstall")
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix install and uninstall are unsupported on this platform; use packaging/windows for the Windows installer",
+        ));
+    }
+    let command = parse(&args)?;
     match command {
         Command::Build { release, features } => run_build(release, features),
         Command::Check { all_features } => {
@@ -346,6 +365,7 @@ fn main_result() -> io::Result<()> {
                 Err(io::Error::other("cargo check failed"))
             }
         }
+        #[cfg(unix)]
         Command::Install {
             options,
             dirs,
@@ -357,6 +377,7 @@ fn main_result() -> io::Result<()> {
             &Manifest::new(root(), dirs, features, udev, systemd, xorg)?,
             &options,
         ),
+        #[cfg(unix)]
         Command::Uninstall { destdir, dirs } => uninstall(
             &Manifest::new(
                 root(),
@@ -387,17 +408,17 @@ fn main() -> ExitCode {
     }
 }
 
-#[allow(dead_code)]
-fn _path(_: &Path) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::path::Path;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_parse_keeps_canonical_runtime_sysconfdir() {
         let command = parse(&args(&["install", "--prefix", "/opt/wiiland"])).unwrap();
@@ -408,6 +429,7 @@ mod tests {
         assert_eq!(dirs.sysconfdir, Path::new("/etc"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_parse_rejects_relocated_sysconfdir() {
         let error = parse(&args(&["install", "--sysconfdir", "/opt/wiiland/etc"])).unwrap_err();
@@ -416,6 +438,7 @@ mod tests {
         assert!(error.to_string().contains("sysconfdir must be /etc"));
     }
 
+    #[cfg(unix)]
     fn parsed_dirs(values: &[&str]) -> LogicalDirs {
         match parse(&args(values)).unwrap() {
             Command::Install { dirs, .. } | Command::Uninstall { dirs, .. } => dirs,
@@ -423,6 +446,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn logical_directory_overrides_are_independent_of_argument_order() {
         for command in ["install", "uninstall"] {

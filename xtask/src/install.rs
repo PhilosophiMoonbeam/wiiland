@@ -1,9 +1,17 @@
-use crate::manifest::{Item, ItemSource, Manifest};
+use crate::manifest::Manifest;
+#[cfg(unix)]
+use crate::manifest::{Item, ItemSource};
+#[cfg(unix)]
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process;
 
 #[derive(Clone, Debug)]
@@ -21,6 +29,7 @@ impl Default for InstallOptions {
     }
 }
 
+#[cfg(unix)]
 fn staged(destdir: &Path, logical: &Path) -> PathBuf {
     if destdir.as_os_str().is_empty() {
         logical.to_path_buf()
@@ -29,6 +38,7 @@ fn staged(destdir: &Path, logical: &Path) -> PathBuf {
     }
 }
 
+#[cfg(unix)]
 fn atomic_write(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     let parent = path
         .parent()
@@ -53,6 +63,7 @@ fn atomic_write(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     result
 }
 
+#[cfg(unix)]
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
@@ -62,6 +73,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hash
 }
 
+#[cfg(unix)]
 fn source_bytes(item: &Item, manifest: &Manifest) -> io::Result<Vec<u8>> {
     match &item.source {
         ItemSource::Root(path) | ItemSource::Built(path) => fs::read(path),
@@ -93,6 +105,7 @@ fn source_bytes(item: &Item, manifest: &Manifest) -> io::Result<Vec<u8>> {
     }
 }
 
+#[cfg(unix)]
 fn marker_path(manifest: &Manifest, destdir: &Path) -> PathBuf {
     staged(
         destdir,
@@ -100,6 +113,7 @@ fn marker_path(manifest: &Manifest, destdir: &Path) -> PathBuf {
     )
 }
 
+#[cfg(unix)]
 fn ensure_parent_dirs(
     destdir: &Path,
     logical_target: &Path,
@@ -126,16 +140,26 @@ fn ensure_parent_dirs(
 }
 
 pub fn install(manifest: &Manifest, options: &InstallOptions) -> io::Result<()> {
-    let items = manifest.items(&options.profile)?;
-    install_items(manifest, options, &items)
+    #[cfg(unix)]
+    {
+        let items = manifest.items(&options.profile)?;
+        install_items(manifest, options, &items)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (manifest, options);
+        Err(unsupported_unix_packaging())
+    }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OwnershipRecord {
     File { logical: PathBuf, expected: String },
     Directory(PathBuf),
 }
 
+#[cfg(unix)]
 fn read_records(marker: &Path) -> io::Result<Option<Vec<OwnershipRecord>>> {
     let mut text = String::new();
     let mut file = match File::open(marker) {
@@ -161,6 +185,7 @@ fn read_records(marker: &Path) -> io::Result<Option<Vec<OwnershipRecord>>> {
     ))
 }
 
+#[cfg(unix)]
 fn record_matches(target: &Path, expected: &str) -> bool {
     fs::symlink_metadata(target)
         .ok()
@@ -169,6 +194,7 @@ fn record_matches(target: &Path, expected: &str) -> bool {
         .is_some_and(|bytes| format!("{:016x}", hash_bytes(&bytes)) == expected)
 }
 
+#[cfg(unix)]
 fn install_items(manifest: &Manifest, options: &InstallOptions, items: &[Item]) -> io::Result<()> {
     let marker = marker_path(manifest, &options.destdir);
     let prior_records = read_records(&marker)?.unwrap_or_default();
@@ -225,6 +251,7 @@ fn install_items(manifest: &Manifest, options: &InstallOptions, items: &[Item]) 
     )
 }
 
+#[cfg(unix)]
 fn safe_record_path(value: &str) -> Option<PathBuf> {
     let path = PathBuf::from(value);
     if !path.is_absolute()
@@ -238,32 +265,47 @@ fn safe_record_path(value: &str) -> Option<PathBuf> {
 }
 
 pub fn uninstall(manifest: &Manifest, destdir: &Path) -> io::Result<()> {
-    let marker = marker_path(manifest, destdir);
-    let Some(records) = read_records(&marker)? else {
-        return Ok(());
-    };
-    let mut owned_dirs = Vec::new();
-    for record in records {
-        match record {
-            OwnershipRecord::File { logical, expected } => {
-                let target = staged(destdir, &logical);
-                if record_matches(&target, &expected) {
-                    fs::remove_file(target)?;
+    #[cfg(unix)]
+    {
+        let marker = marker_path(manifest, destdir);
+        let Some(records) = read_records(&marker)? else {
+            return Ok(());
+        };
+        let mut owned_dirs = Vec::new();
+        for record in records {
+            match record {
+                OwnershipRecord::File { logical, expected } => {
+                    let target = staged(destdir, &logical);
+                    if record_matches(&target, &expected) {
+                        fs::remove_file(target)?;
+                    }
                 }
+                OwnershipRecord::Directory(logical) => owned_dirs.push(logical),
             }
-            OwnershipRecord::Directory(logical) => owned_dirs.push(logical),
         }
+        fs::remove_file(&marker)?;
+        owned_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        owned_dirs.dedup();
+        for logical in owned_dirs {
+            let _ = fs::remove_dir(staged(destdir, &logical));
+        }
+        Ok(())
     }
-    fs::remove_file(&marker)?;
-    owned_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    owned_dirs.dedup();
-    for logical in owned_dirs {
-        let _ = fs::remove_dir(staged(destdir, &logical));
+    #[cfg(not(unix))]
+    {
+        let _ = (manifest, destdir);
+        Err(unsupported_unix_packaging())
     }
-    Ok(())
+}
+#[cfg(not(unix))]
+fn unsupported_unix_packaging() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix install and uninstall are unsupported on this platform; use packaging/windows for the Windows installer",
+    )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::manifest::{Features, LogicalDirOverrides};
