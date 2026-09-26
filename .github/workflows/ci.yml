@@ -532,6 +532,44 @@ jobs:
                       finally { LocalFree(text); }
                   } finally { LocalFree(descriptor); }
               }
+              [StructLayout(LayoutKind.Sequential)]
+              private struct SecurityAttributes {
+                  public uint Length;
+                  public IntPtr Descriptor;
+                  public int Inherit;
+              }
+              [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                  string sddl, uint revision, out IntPtr descriptor, IntPtr length);
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              private static extern IntPtr CreateNamedPipeW(string name, uint openMode, uint pipeMode,
+                  uint instances, uint outSize, uint inSize, uint timeout, ref SecurityAttributes attributes);
+              public static string CompareAcl(string userSid, string logonSid, uint mask) {
+                  string sddl = "O:" + userSid + "D:P(D;;WDWO;;;OW)(A;;0x"
+                      + mask.ToString("X8") + ";;;" + logonSid + ")";
+                  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1,
+                      out IntPtr descriptor, IntPtr.Zero))
+                      return "sddl-error=" + Marshal.GetLastWin32Error();
+                  try {
+                      var attributes = new SecurityAttributes {
+                          Length = (uint)Marshal.SizeOf<SecurityAttributes>(),
+                          Descriptor = descriptor, Inherit = 0
+                      };
+                      string name = @"\\.\pipe\WiiLand.AclProbe." + Guid.NewGuid().ToString("N");
+                      IntPtr server = CreateNamedPipeW(name, 0x40080003, 8, 1, 4096, 4096, 0,
+                          ref attributes);
+                      if (server == IntPtr.Zero || server == new IntPtr(-1))
+                          return "server-error=" + Marshal.GetLastWin32Error();
+                      try {
+                          IntPtr client = CreateFileW(name, 0x00120003, 0, IntPtr.Zero, 3,
+                              0x40110000, IntPtr.Zero);
+                          if (client == IntPtr.Zero || client == new IntPtr(-1))
+                              return "client-error=" + Marshal.GetLastWin32Error();
+                          CloseHandle(client);
+                          return "client-opened";
+                      } finally { CloseHandle(server); }
+                  } finally { LocalFree(descriptor); }
+              }
               public static int GroupAttributes(IntPtr token, string expected) {
                   int bytes;
                   GetTokenInformation(token, 2, IntPtr.Zero, 0, out bytes);
@@ -580,6 +618,8 @@ jobs:
                     Write-Output "DACL AccessCheck READ_DATA: $([WiiLandTokenProbe]::AccessDecision($pipes[0].FullName, $groupToken, 1))"
                     Write-Output "DACL AccessCheck full mask: $([WiiLandTokenProbe]::AccessDecision($pipes[0].FullName, $groupToken, 0x00120003))"
                     Write-Output "Pipe mandatory label: $([WiiLandTokenProbe]::PipeLabel($pipes[0].FullName))"
+                    Write-Output "Control pipe 0x00120003: $([WiiLandTokenProbe]::CompareAcl($caller.User.Value, $pipeSid, 0x00120003))"
+                    Write-Output "Read-attributes pipe 0x00120083: $([WiiLandTokenProbe]::CompareAcl($caller.User.Value, $pipeSid, 0x00120083))"
                   } finally {
                     [void][WiiLandTokenProbe]::CloseHandle($groupToken)
                   }
