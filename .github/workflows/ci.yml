@@ -459,6 +459,24 @@ jobs:
             Write-Output 'Smoke scope: daemon dry-run and current-logon named-pipe IPC only; no physical Wii Remote or signed VHF driver test.'
           }
           catch {
+            # Do not print account names or SIDs in public CI logs.
+            $groups = @(whoami /groups /fo csv /nh | ConvertFrom-Csv -Header Name, Type, SID, Attributes)
+            $logonGroups = @($groups | Where-Object { $_.SID -match '^S-1-5-5-\d+-\d+$' })
+            Write-Output "Current token logon groups: $($logonGroups.Count)"
+            foreach ($group in $logonGroups) {
+              Write-Output "Current token logon attributes: $($group.Attributes)"
+            }
+            if ($logonGroups.Count -eq 1) {
+              $pipePath = "\\.\pipe\WiiLand.$($logonGroups[0].SID).daemon"
+              try {
+                $acl = Get-Acl -LiteralPath $pipePath -ErrorAction Stop
+                foreach ($rule in $acl.Access) {
+                  Write-Output "Pipe ACE: type=$($rule.AccessControlType) mask=$($rule.FileSystemRights.value__) identity-string-matches-logon=$($rule.IdentityReference.Value -eq $logonGroups[0].SID)"
+                }
+              } catch {
+                Write-Output "Pipe descriptor query unavailable: $($_.Exception.GetType().Name)"
+              }
+            }
             if ($daemonProcess) {
               $daemonProcess.Refresh()
               if (-not $daemonProcess.HasExited) {
