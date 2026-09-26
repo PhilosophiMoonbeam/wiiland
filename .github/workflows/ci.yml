@@ -452,6 +452,10 @@ jobs:
             if ($statusText -notmatch '(?m)^socket_path=\\\\\.\\pipe\\WiiLand\.S-1-5-5-\d+-\d+\.daemon$') {
               throw 'IPC status did not report the current Windows logon named-pipe endpoint'
             }
+            $again = @(& $statusClient 2>&1)
+            if ($LASTEXITCODE -ne 0 -or ($again -join "`n") -notmatch "(?m)^pid=$($daemonProcess.Id)$") {
+              throw "A second authenticated IPC status connection failed: $($again -join '; ')"
+            }
             $daemonProcess.Refresh()
             if ($daemonProcess.HasExited) {
               throw "wiilandd exited after replying to IPC status (exit $($daemonProcess.ExitCode))"
