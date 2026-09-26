@@ -432,7 +432,7 @@ jobs:
               Start-Sleep -Milliseconds 100
             }
             if (-not $statusReady) {
-              throw 'Timed out waiting for wiilandd Windows IPC status'
+              throw "Timed out waiting for wiilandd Windows IPC status; last client exit $statusExit`: $($statusLines -join '; ')"
             }
 
             $statusText = $statusLines -join "`n"
