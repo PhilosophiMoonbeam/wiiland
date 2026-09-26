@@ -473,6 +473,33 @@ jobs:
               [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
               public static extern IntPtr CreateFileW(string path, uint access, uint share,
                   IntPtr security, uint disposition, uint flags, IntPtr templateFile);
+              [DllImport("advapi32.dll", SetLastError = true)]
+              private static extern bool GetTokenInformation(IntPtr token, int infoClass,
+                  IntPtr buffer, int length, out int required);
+              [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              private static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr text);
+              [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr memory);
+              public static int GroupAttributes(IntPtr token, string expected) {
+                  int bytes;
+                  GetTokenInformation(token, 2, IntPtr.Zero, 0, out bytes);
+                  if (bytes < 16) return -1;
+                  IntPtr buffer = Marshal.AllocHGlobal(bytes);
+                  try {
+                      if (!GetTokenInformation(token, 2, buffer, bytes, out bytes)) return -1;
+                      int count = Marshal.ReadInt32(buffer);
+                      if (count < 0 || count > (bytes - 8) / 16) return -1;
+                      for (int index = 0; index < count; index++) {
+                          IntPtr sid = Marshal.ReadIntPtr(buffer, 8 + index * 16);
+                          if (!ConvertSidToStringSidW(sid, out IntPtr text)) return -1;
+                          try {
+                              if (String.Equals(Marshal.PtrToStringUni(text), expected,
+                                  StringComparison.OrdinalIgnoreCase))
+                                  return Marshal.ReadInt32(buffer, 8 + index * 16 + 8);
+                          } finally { LocalFree(text); }
+                      }
+                      return -2;
+                  } finally { Marshal.FreeHGlobal(buffer); }
+              }
           }
           '@
             $token = [IntPtr]::Zero
@@ -493,6 +520,16 @@ jobs:
                 $pipeSid = [regex]::Match($pipes[0].Name, 'S-1-5-5-\d+-\d+').Value
                 $caller = [System.Security.Principal.WindowsIdentity]::GetCurrent()
                 Write-Output "Effective token matches pipe logon group: $([bool](@($caller.Groups | Where-Object { $_.Value -eq $pipeSid }).Count))"
+                $groupToken = [IntPtr]::Zero
+                if ([WiiLandTokenProbe]::OpenProcessToken([WiiLandTokenProbe]::GetCurrentProcess(), 8, [ref]$groupToken)) {
+                  try {
+                    Write-Output "Pipe logon SID in caller TokenGroups attributes: $([WiiLandTokenProbe]::GroupAttributes($groupToken, $pipeSid))"
+                  } finally {
+                    [void][WiiLandTokenProbe]::CloseHandle($groupToken)
+                  }
+                } else {
+                  Write-Output 'Caller TokenGroups query unavailable'
+                }
                 foreach ($mask in @(0x00120003, 0x00020003, 0x00000003, 0x00000001, 0x00000002)) {
                   $handle = [WiiLandTokenProbe]::CreateFileW($pipes[0].FullName, [uint32]$mask, 0,
                     [IntPtr]::Zero, 3, 0x40000000, [IntPtr]::Zero)
