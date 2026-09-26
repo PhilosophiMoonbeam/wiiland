@@ -470,6 +470,9 @@ jobs:
               [DllImport("advapi32.dll", SetLastError = true)]
               public static extern bool IsTokenRestricted(IntPtr token);
               [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              public static extern IntPtr CreateFileW(string path, uint access, uint share,
+                  IntPtr security, uint disposition, uint flags, IntPtr templateFile);
           }
           '@
             $token = [IntPtr]::Zero
@@ -488,6 +491,17 @@ jobs:
               Write-Output "Live WiiLand daemon pipe count: $($pipes.Count)"
               if ($pipes.Count -eq 1) {
                 $pipeSid = [regex]::Match($pipes[0].Name, 'S-1-5-5-\d+-\d+').Value
+                foreach ($mask in @(0x00120003, 0x00020003, 0x00000003, 0x00000001, 0x00000002)) {
+                  $handle = [WiiLandTokenProbe]::CreateFileW($pipes[0].FullName, [uint32]$mask, 0,
+                    [IntPtr]::Zero, 3, 0x40000000, [IntPtr]::Zero)
+                  $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                  $opened = $handle -ne [IntPtr]::Zero -and $handle -ne [IntPtr]::new(-1)
+                  Write-Output "Pipe data-access probe: mask=$mask opened=$opened error=$errorCode"
+                  if ($opened) {
+                    [void][WiiLandTokenProbe]::CloseHandle($handle)
+                    Start-Sleep -Milliseconds 100
+                  }
+                }
                 $acl = Get-Acl -LiteralPath $pipes[0].FullName -ErrorAction Stop
                 foreach ($rule in $acl.Access) {
                   Write-Output "Pipe ACE: type=$($rule.AccessControlType) mask=$($rule.FileSystemRights.value__) identity-string-matches-pipe-logon=$($rule.IdentityReference.Value -eq $pipeSid)"
