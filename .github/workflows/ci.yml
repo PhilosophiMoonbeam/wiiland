@@ -574,7 +574,7 @@ jobs:
                 $caller = [System.Security.Principal.WindowsIdentity]::GetCurrent()
                 Write-Output "Effective token matches pipe logon group: $([bool](@($caller.Groups | Where-Object { $_.Value -eq $pipeSid }).Count))"
                 $groupToken = [IntPtr]::Zero
-                if ([WiiLandTokenProbe]::OpenProcessToken([WiiLandTokenProbe]::GetCurrentProcess(), 8, [ref]$groupToken)) {
+                if ([WiiLandTokenProbe]::OpenProcessToken([WiiLandTokenProbe]::GetCurrentProcess(), 10, [ref]$groupToken)) {
                   try {
                     Write-Output "Pipe logon SID in caller TokenGroups attributes: $([WiiLandTokenProbe]::GroupAttributes($groupToken, $pipeSid))"
                     Write-Output "DACL AccessCheck READ_DATA: $([WiiLandTokenProbe]::AccessDecision($pipes[0].FullName, $groupToken, 1))"
