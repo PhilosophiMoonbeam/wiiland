@@ -12,10 +12,10 @@ use std::{error::Error, fmt, time::Duration};
 pub const TRANSPORT_VERSION: u32 = 1;
 /// Only successful bootstrap status. Any nonzero status indicates generic failure.
 pub const READY_STATUS_OK: u32 = 0;
-/// Access granted to the client when connecting to its private return pipe.
-/// This is `FILE_READ_DATA | FILE_WRITE_DATA | READ_CONTROL | SYNCHRONIZE`; it
-/// intentionally excludes `FILE_CREATE_PIPE_INSTANCE`.
-pub const BOOTSTRAP_ACCESS_MASK: u32 = 0x0012_0003;
+/// Access granted to the current logon on both bootstrap pipe endpoints.
+/// This is `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
+/// READ_CONTROL | SYNCHRONIZE`; it excludes `FILE_CREATE_PIPE_INSTANCE`.
+pub const BOOTSTRAP_ACCESS_MASK: u32 = 0x0012_0083;
 /// Absolute deadline for the entire B/R connection attempt, not per record.
 pub const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(2);
 

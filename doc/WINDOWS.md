@@ -46,8 +46,10 @@ for that application connection. Application JSON travels only on the return
 pipe; there is no legacy direct-JSON or one-pipe fallback.
 
 Both endpoints use an explicit logon-SID access-control entry granting mask
-`0x00120003` (read, write, read-control, and synchronize); it deliberately
-does not grant `FILE_CREATE_PIPE_INSTANCE`. An Owner Rights deny entry blocks
+`0x00120083` (read and write data, read attributes, read-control, and synchronize).
+The read-attributes right is required for Windows to open these named pipes;
+the mask deliberately excludes `FILE_CREATE_PIPE_INSTANCE`. An Owner Rights
+deny entry blocks
 `WRITE_DAC` and `WRITE_OWNER`. Pipe instances use
 `FILE_FLAG_FIRST_PIPE_INSTANCE`, a maximum of one instance, overlapped I/O, and
 `PIPE_REJECT_REMOTE_CLIENTS`. These DACL and pipe-creation settings constrain
