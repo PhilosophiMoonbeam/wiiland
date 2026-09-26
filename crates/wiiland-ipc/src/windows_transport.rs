@@ -82,7 +82,9 @@ impl WindowsPipe {
     }
 
     pub(crate) fn connect_default() -> io::Result<(PathBuf, Self)> {
-        let identity = CurrentIdentity::open()?;
+        let identity = CurrentIdentity::open().map_err(|error| {
+            io::Error::new(error.kind(), format!("querying current logon: {error}"))
+        })?;
         let path = endpoint_path(&identity.logon_sid_name);
         let stream = Self::connect_for_identity(&path, &identity)?;
         Ok((path, stream))
@@ -103,29 +105,48 @@ impl WindowsPipe {
             .checked_add(BOOTSTRAP_DEADLINE)
             .ok_or_else(|| timeout_error("bootstrap deadline is out of range"))?;
         let pipe_name = nul_terminated_wide(path)?;
-        let rendezvous = open_pipe(&pipe_name, deadline)?;
+        let rendezvous = open_pipe(&pipe_name, deadline).map_err(|error| {
+            io::Error::new(error.kind(), format!("opening daemon rendezvous: {error}"))
+        })?;
         ensure_before_deadline(deadline, "bootstrap deadline exceeded")?;
         // The descriptor remains a useful ACL sanity check, but is not proof
         // of the server's identity; that is established by the R-pipe token.
-        verify_pipe_security(rendezvous.0, identity)?;
+        verify_pipe_security(rendezvous.0, identity).map_err(|error| {
+            io::Error::new(error.kind(), format!("verifying daemon pipe DACL: {error}"))
+        })?;
         ensure_before_deadline(deadline, "bootstrap deadline exceeded")?;
 
         let identifier = random_return_pipe_id(deadline)?;
         let logon_sid = LogonSid::new(&identity.logon_sid_name).map_err(bootstrap_error)?;
         let return_name = derive_return_pipe_name(&logon_sid, &identifier);
         let return_name = nul_terminated_wide(Path::new(&return_name))?;
-        let return_pipe = create_return_pipe(&return_name, identity)?;
+        let return_pipe = create_return_pipe(&return_name, identity).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("creating client return pipe: {error}"),
+            )
+        })?;
         let event = create_event()?;
         ensure_before_deadline(deadline, "bootstrap deadline exceeded")?;
 
         let announce = ClientAnnounce::new(identifier).encode();
         write_all_until(rendezvous.0, event.0, &announce, deadline)?;
-        connect_return_pipe(return_pipe.0, &event, deadline)?;
+        connect_return_pipe(return_pipe.0, &event, deadline).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("connecting client return pipe: {error}"),
+            )
+        })?;
 
         let mut hello_record = [0_u8; DAEMON_HELLO_LEN];
         read_exact_until(return_pipe.0, event.0, &mut hello_record, deadline)?;
         let hello = DaemonHello::parse(&hello_record).map_err(bootstrap_error)?;
-        authenticate_pipe_writer(return_pipe.0, identity, deadline)?;
+        authenticate_pipe_writer(return_pipe.0, identity, deadline).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("authenticating daemon hello: {error}"),
+            )
+        })?;
 
         let echo = ClientEcho::new(*hello.challenge()).encode();
         write_all_until(rendezvous.0, event.0, &echo, deadline)?;
@@ -133,7 +154,12 @@ impl WindowsPipe {
         let mut ready_record = [0_u8; DAEMON_READY_LEN];
         read_exact_until(return_pipe.0, event.0, &mut ready_record, deadline)?;
         let ready = DaemonReady::parse(&ready_record).map_err(bootstrap_error)?;
-        authenticate_pipe_writer(return_pipe.0, identity, deadline)?;
+        authenticate_pipe_writer(return_pipe.0, identity, deadline).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("authenticating daemon ready: {error}"),
+            )
+        })?;
         if ready.status() != READY_STATUS_OK {
             return Err(permission_denied("daemon rejected the IPC bootstrap"));
         }
