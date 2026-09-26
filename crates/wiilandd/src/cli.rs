@@ -1050,6 +1050,14 @@ fn windows_select_bluetooth_device<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    const TEST_IPC_PATH: &str = "/tmp/wiilandd.sock";
+    #[cfg(windows)]
+    const TEST_IPC_PATH: &str = r"C:\wiilandd.sock";
+    #[cfg(unix)]
+    const TEST_HELP_PATH: &str = "/tmp/--help";
+    #[cfg(windows)]
+    const TEST_HELP_PATH: &str = r"C:\--help";
 
     fn pass(args: &[&str]) -> Pass1 {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -1069,12 +1077,12 @@ mod tests {
     fn ipc_accepts_both_path_forms() {
         assert_eq!(pass(&["--no-ipc"]).ipc, IpcMode::Disabled);
         assert_eq!(
-            pass(&["--ipc-socket", "/tmp/wiilandd.sock"]).ipc,
-            IpcMode::Path(PathBuf::from("/tmp/wiilandd.sock"))
+            pass(&["--ipc-socket", TEST_IPC_PATH]).ipc,
+            IpcMode::Path(PathBuf::from(TEST_IPC_PATH))
         );
         assert_eq!(
-            pass(&["--ipc-socket=/tmp/wiilandd.sock"]).ipc,
-            IpcMode::Path(PathBuf::from("/tmp/wiilandd.sock"))
+            pass(&[&format!("--ipc-socket={TEST_IPC_PATH}")]).ipc,
+            IpcMode::Path(PathBuf::from(TEST_IPC_PATH))
         );
     }
 
@@ -1096,7 +1104,7 @@ mod tests {
     fn ipc_rejects_no_ipc_conflicts() {
         assert!(
             Cli::parse_pass1(
-                &["--no-ipc", "--ipc-socket", "/tmp/wiilandd.sock"]
+                &["--no-ipc", "--ipc-socket", TEST_IPC_PATH]
                     .into_iter()
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
@@ -1104,32 +1112,27 @@ mod tests {
             .is_err()
         );
         assert!(
-            Cli::parse_pass1(
-                &["--ipc-socket=/tmp/wiilandd.sock", "--no-ipc"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            )
+            Cli::parse_pass1(&[
+                format!("--ipc-socket={TEST_IPC_PATH}"),
+                "--no-ipc".to_owned()
+            ])
             .is_err()
         );
     }
 
     #[test]
     fn ipc_socket_value_is_consumed_before_action_parsing() {
-        let parsed = pass(&["--ipc-socket", "/tmp/--help", "--help"]);
+        let parsed = pass(&["--ipc-socket", TEST_HELP_PATH, "--help"]);
         assert_eq!(parsed.action, Action::Help);
-        assert_eq!(parsed.ipc, IpcMode::Path(PathBuf::from("/tmp/--help")));
+        assert_eq!(parsed.ipc, IpcMode::Path(PathBuf::from(TEST_HELP_PATH)));
     }
 
     #[test]
     fn pass2_preserves_ipc_without_touching_config() {
-        let pass1 = pass(&["--ipc-socket=/tmp/wiilandd.sock"]);
+        let pass1 = pass(&[&format!("--ipc-socket={TEST_IPC_PATH}")]);
         let config = Config::default();
         let parsed = Cli::parse_pass2(&[], config.clone(), pass1).unwrap();
-        assert_eq!(
-            parsed.ipc,
-            IpcMode::Path(PathBuf::from("/tmp/wiilandd.sock"))
-        );
+        assert_eq!(parsed.ipc, IpcMode::Path(PathBuf::from(TEST_IPC_PATH)));
         assert_eq!(parsed.config, config);
     }
 

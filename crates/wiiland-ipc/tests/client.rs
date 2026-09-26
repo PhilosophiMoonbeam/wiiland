@@ -326,7 +326,6 @@ fn notification_backlog_overflow_terminates_client() {
             send_notification_frame(&mut stream, sequence, LARGE_NOTIFICATION_FRAME_BYTES);
         }
         send_notification_frame(&mut stream, 5, 1024);
-        send(&mut stream, status(request.id));
 
         let mut unexpected_request = Vec::new();
         assert_eq!(
