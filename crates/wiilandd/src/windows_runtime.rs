@@ -491,7 +491,7 @@ struct WindowsRuntime {
     dry_run: bool,
     trace: TraceConfig,
     selected_path: Option<PathBuf>,
-    slots: [Option<WindowsBridgeDevice>; MAX_DEVICES],
+    slots: Vec<Option<WindowsBridgeDevice>>,
     retired_output_workers: Vec<JoinHandle<()>>,
     monitor: Option<Monitor>,
     monitor_pending: bool,
@@ -585,7 +585,7 @@ impl WindowsRuntime {
             dry_run: cli.dry_run,
             trace: cli.trace,
             selected_path,
-            slots: std::array::from_fn(|_| None),
+            slots: std::iter::repeat_with(|| None).take(MAX_DEVICES).collect(),
             retired_output_workers: Vec::with_capacity(MAX_OUTPUT_WORKERS),
             monitor,
             monitor_pending,
@@ -939,7 +939,7 @@ impl WindowsRuntime {
     }
 
     fn status_snapshot(
-        slots: &[Option<WindowsBridgeDevice>; MAX_DEVICES],
+        slots: &[Option<WindowsBridgeDevice>],
         dry_run: bool,
         path: &Path,
     ) -> Status {
@@ -952,7 +952,7 @@ impl WindowsRuntime {
         }
     }
 
-    fn device_snapshot(slots: &[Option<WindowsBridgeDevice>; MAX_DEVICES]) -> Vec<DeviceInfo> {
+    fn device_snapshot(slots: &[Option<WindowsBridgeDevice>]) -> Vec<DeviceInfo> {
         slots
             .iter()
             .filter_map(|slot| slot.as_ref().map(WindowsBridgeDevice::info))
