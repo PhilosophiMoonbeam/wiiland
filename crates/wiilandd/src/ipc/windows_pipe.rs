@@ -55,6 +55,7 @@ use super::{READ_CHUNK, WRITE_BUDGET};
 const ENDPOINT_PREFIX: &str = r"\\.\pipe\WiiLand.";
 const ENDPOINT_SUFFIX: &str = ".daemon";
 const LOGON_ID_GROUP_ATTRIBUTES: u32 = 0xC000_0000;
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 const SHUTDOWN_COMPLETION_KEY: usize = usize::MAX;
 const TIMER_UPDATE_COMPLETION_KEY: usize = usize::MAX - 1;
 const CLIENT_ANNOUNCE_BYTES: usize = 20;
@@ -1348,6 +1349,12 @@ fn token_sid(
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "process token did not return exactly one logon SID",
+                ));
+            }
+            if groups.Groups[0].Attributes & SE_GROUP_ENABLED == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "process token logon SID is not enabled for pipe access",
                 ));
             }
             groups.Groups[0].Sid

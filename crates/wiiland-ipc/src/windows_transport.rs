@@ -52,6 +52,7 @@ const PIPE_ENDPOINT_SUFFIX: &str = ".daemon";
 const MAX_FINITE_WAIT_MS: u32 = u32::MAX - 1;
 const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
 const LOGON_ID_GROUP_ATTRIBUTES: u32 = 0xC000_0000;
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const INHERITED_ACE: u8 = 0x10;
@@ -446,6 +447,12 @@ fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<TokenS
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "process token did not return exactly one logon SID",
+                ));
+            }
+            if groups.Groups[0].Attributes & SE_GROUP_ENABLED == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "process token logon SID is not enabled for pipe access",
                 ));
             }
             groups.Groups[0].Sid

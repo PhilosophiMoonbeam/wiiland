@@ -460,7 +460,9 @@ jobs:
           }
           catch {
             # Do not print account names or SIDs in public CI logs.
-            $groups = @(whoami /groups /fo csv /nh | ConvertFrom-Csv -Header Name, Type, SID, Attributes)
+            $whoamiGroups = @(whoami /groups /fo csv /nh)
+            Write-Output "whoami group lines: $($whoamiGroups.Count), logon-SID pattern present: $([bool]($whoamiGroups -match 'S-1-5-5-\d+-\d+'))"
+            $groups = @($whoamiGroups | ConvertFrom-Csv -Header Name, Type, SID, Attributes)
             $logonGroups = @($groups | Where-Object { $_.SID -match '^S-1-5-5-\d+-\d+$' })
             Write-Output "Current token logon groups: $($logonGroups.Count)"
             foreach ($group in $logonGroups) {
