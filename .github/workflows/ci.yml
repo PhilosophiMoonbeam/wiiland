@@ -460,6 +460,28 @@ jobs:
           }
           catch {
             # Do not print account names or SIDs in public CI logs.
+            Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class WiiLandTokenProbe {
+              [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+              [DllImport("advapi32.dll", SetLastError = true)]
+              public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+              [DllImport("advapi32.dll", SetLastError = true)]
+              public static extern bool IsTokenRestricted(IntPtr token);
+              [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+          }
+          '@
+            $token = [IntPtr]::Zero
+            if ([WiiLandTokenProbe]::OpenProcessToken([WiiLandTokenProbe]::GetCurrentProcess(), 8, [ref]$token)) {
+              try {
+                Write-Output "Caller token restricted: $([WiiLandTokenProbe]::IsTokenRestricted($token))"
+              } finally {
+                [void][WiiLandTokenProbe]::CloseHandle($token)
+              }
+            } else {
+              Write-Output 'Caller token restriction query unavailable'
+            }
             try {
               $pipes = @(Get-ChildItem -LiteralPath '\\.\pipe\' -ErrorAction Stop |
                 Where-Object { $_.Name -match '^WiiLand\.S-1-5-5-\d+-\d+\.daemon$' })
