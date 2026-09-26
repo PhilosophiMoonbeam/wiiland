@@ -491,6 +491,8 @@ jobs:
               Write-Output "Live WiiLand daemon pipe count: $($pipes.Count)"
               if ($pipes.Count -eq 1) {
                 $pipeSid = [regex]::Match($pipes[0].Name, 'S-1-5-5-\d+-\d+').Value
+                $caller = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                Write-Output "Effective token matches pipe logon group: $([bool](@($caller.Groups | Where-Object { $_.Value -eq $pipeSid }).Count))"
                 foreach ($mask in @(0x00120003, 0x00020003, 0x00000003, 0x00000001, 0x00000002)) {
                   $handle = [WiiLandTokenProbe]::CreateFileW($pipes[0].FullName, [uint32]$mask, 0,
                     [IntPtr]::Zero, 3, 0x40000000, [IntPtr]::Zero)
