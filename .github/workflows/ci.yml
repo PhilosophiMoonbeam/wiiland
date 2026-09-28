@@ -386,24 +386,57 @@ jobs:
         shell: pwsh
         run: cargo test --workspace --all-features --locked
 
-      - name: Build the real daemon and IPC status example
+      - name: Build daemon, IPC example, GUI, and show clients
         shell: pwsh
         run: |
           cargo build --locked -p wiilandd
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked -p wiiland-ipc --example status
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked -p wiiland-config -p wiiland-show
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Smoke real daemon dry-run and IPC status (no hardware or driver test)
+      - name: Smoke report-only GUI from unrelated working directory
+        shell: pwsh
+        run: |
+          $gui = Join-Path $env:GITHUB_WORKSPACE 'target\debug\wiiland-config.exe'
+          $siblingDaemon = Join-Path $env:GITHUB_WORKSPACE 'target\debug\wiilandd.exe'
+          if (-not (Test-Path $gui)) { throw "Missing GUI executable: $gui" }
+          if (-not (Test-Path $siblingDaemon)) { throw "Missing local sibling daemon: $siblingDaemon" }
+
+          $smokeWorkingDirectory = Join-Path $env:RUNNER_TEMP 'wiiland-config-unrelated-working-directory'
+          New-Item -ItemType Directory -Path $smokeWorkingDirectory -Force | Out-Null
+          Push-Location $smokeWorkingDirectory
+          try {
+            $env:WIILAND_CONFIG_SMOKE_TEST = '1'
+            $guiOutput = @(& $gui 2>&1)
+            $guiExit = $LASTEXITCODE
+          }
+          finally {
+            Pop-Location
+          }
+
+          $guiOutput | Write-Output
+          if ($guiExit -ne 0) {
+            throw "Report-only wiiland-config smoke failed with exit $guiExit"
+          }
+
+          Write-Output "GUI smoke working directory: $smokeWorkingDirectory"
+          Write-Output 'GUI smoke scope: report-only state checks and local sibling wiilandd.exe resolution; no real window, hardware, or installer test.'
+
+
+      - name: Smoke daemon dry-run, IPC status, and show list (no hardware or driver test)
         shell: pwsh
         run: |
           # The Windows client accepts only the current-logon default pipe, so use both defaults.
           $daemon = Join-Path $env:GITHUB_WORKSPACE 'target\debug\wiilandd.exe'
           $statusClient = Join-Path $env:GITHUB_WORKSPACE 'target\debug\examples\status.exe'
+          $showClient = Join-Path $env:GITHUB_WORKSPACE 'target\debug\wiiland-show.exe'
           $daemonStdout = Join-Path $env:RUNNER_TEMP 'wiilandd-windows-smoke.stdout'
           $daemonStderr = Join-Path $env:RUNNER_TEMP 'wiilandd-windows-smoke.stderr'
           if (-not (Test-Path $daemon)) { throw "Missing daemon executable: $daemon" }
           if (-not (Test-Path $statusClient)) { throw "Missing IPC status client: $statusClient" }
+          if (-not (Test-Path $showClient)) { throw "Missing wiiland-show client: $showClient" }
 
           $daemonProcess = $null
           try {
@@ -456,6 +489,17 @@ jobs:
             if ($LASTEXITCODE -ne 0 -or ($again -join "`n") -notmatch "(?m)^pid=$($daemonProcess.Id)$") {
               throw "A second authenticated IPC status connection failed: $($again -join '; ')"
             }
+            $showOutput = @(& $showClient list 2>&1)
+            $showExit = $LASTEXITCODE
+            if ($showExit -ne 0) {
+              throw "wiiland-show list failed through the default current-logon pipe with exit $showExit`: $($showOutput -join '; ')"
+            }
+            if ($showOutput.Count -ne 0) {
+              throw "wiiland-show list expected zero devices and no output, got: $($showOutput -join '; ')"
+            }
+            Write-Output 'wiiland-show list: success with zero devices through the authenticated current-logon default pipe.'
+            Write-Output 'wiiland-show scope: non-interactive list only; dry-run daemon; no interactive window or hardware access.'
+
             $daemonProcess.Refresh()
             if ($daemonProcess.HasExited) {
               throw "wiilandd exited after replying to IPC status (exit $($daemonProcess.ExitCode))"

@@ -88,14 +88,82 @@ availability, and same-logon process identity is not authenticated.
 
 ## Current user-facing limits
 
-There is not yet a supported, end-to-end Windows user workflow:
+There is not yet a supported, end-to-end Windows user workflow. The locally
+built `wiiland-config` GUI and `wiiland-show` terminal UI are development tools,
+not part of the Windows release bundle or a supported packaged UI workflow.
 
 - A development CLI pairing path exists as `wiilandd --pair`, but it is not release-qualified for all Wii Remote models. There is no Windows pairing GUI or validated general manual-pairing recipe; do not assume Windows Bluetooth Settings can pair and operate every model.
-- The daemon now has a Windows runtime and named-pipe transport, but neither is release-qualified. The installer writes the daemon's per-user logon startup entry; it does not launch the daemon as that user or prove pairing, input, or output works.
-- `wiiland-config` and `wiiland-show` are not included in this package. Their Windows UI, process-control, diagnostic, and device-control flows are not supported by these scripts. Linux-only commands, device paths, systemd operations, and diagnostics must not be presented as Windows instructions.
+- The daemon has a Windows runtime and named-pipe transport, but neither is release-qualified. The installer writes the daemon's per-user logon startup entry; it does not launch the daemon as that user or prove pairing, input, or output works.
+- Local GUI configuration and terminal observation do not qualify the packaged UI, device-control flows, or hardware output. Linux-only commands, device paths, systemd operations, and diagnostics must not be presented as Windows instructions.
 - Windows HID report handling remains under development and is not qualified end to end. Known scope limits include report combinations that require cycling modes, no full-resolution IR `0x3e`/`0x3f`, and no promise for undocumented/third-party extension formats or direct Wii U Pro HID behavior.
 
 These are release blockers where they affect advertised functionality. The scripts make no claim that pairing, controller input, a GUI, or daemon runtime works merely because installation succeeds.
+
+## Local Windows 11 development UIs (no installer)
+
+From a source checkout on Windows 11 with the Windows MSVC Rust toolchain,
+open an ordinary interactive, **non-elevated** PowerShell session. These
+user-mode tools can be built without installing the privileged service or
+driver:
+
+```powershell
+cargo build --locked -p wiilandd -p wiiland-config -p wiiland-show
+```
+
+Cargo's default output directory is `target\debug` in the checkout (use the
+configured target directory instead if one is set). From the checkout, capture
+the absolute build directory once; the executables remain siblings, and the
+resulting paths work even after changing PowerShell's working directory:
+
+```powershell
+$bin = (Resolve-Path .\target\debug).Path
+& (Join-Path $bin 'wiiland-config.exe')
+& (Join-Path $bin 'wiiland-show.exe') list
+```
+
+These commands use the current-logon daemon IPC endpoint. To start the daemon
+manually with normal configuration, run `.\target\debug\wiilandd.exe` in a
+separate non-elevated interactive PowerShell session first. Alternatively,
+the GUI's Overview daemon **Start** control starts its selected executable
+without extra arguments. Neither route installs or starts the privileged
+output broker or driver; unavailable output remains a development limitation.
+Do not run two per-logon daemon instances at once.
+
+The GUI selects `wiilandd.exe` beside **the GUI executable**, regardless of
+the PowerShell working directory. If that sibling is absent, it checks the
+installed Program Files executable; an existing but invalid sibling is an
+error, not a reason to fall back. To choose another build, open Overview →
+**Configuration file & advanced settings** and set **Daemon executable** to
+an absolute path to a regular `.exe` file. The selected daemon executable is
+also used to load, validate, and save configuration; **Validate and save**
+does not restart the daemon. **Save and restart** applies the default
+configuration by restarting a normal daemon, whereas saving a custom file
+does not make the daemon load that custom file.
+
+For output-suppressed inspection instead, stop the running daemon and start
+one manually with `.\target\debug\wiilandd.exe --no-config --dry-run` in a
+separate non-elevated session. Leave it running while the GUI or show attaches
+over IPC; `--no-config` bypasses normal config and `--dry-run` suppresses
+outputs. The GUI refuses to restart a daemon reporting `dry_run=true`; stop
+it and manually relaunch with the desired flags instead. The GUI does **not**
+pair controllers. For pairing inquiry, address verification, and explicit
+CLI pairing instructions see [Local Windows 11 user-mode hardware
+check](#local-windows-11-user-mode-hardware-check).
+
+`wiiland-show.exe list` lists devices observed by the running daemon, not
+all physical HID devices; `wiiland-show.exe 1` observes the daemon's first
+device, with only quit/freeze keys available in daemon mode. A selector may
+also be the exact opaque Windows HID device ID returned by the list. On
+Windows, `--socket` accepts only a current-logon named-pipe daemon endpoint,
+not an arbitrary Unix socket or a cross-logon connection. After **stopping**
+the daemon, `wiiland-show.exe --direct list` and
+`wiiland-show.exe --direct 1` are explicit, unqualified development hardware
+diagnostics; direct mode owns hardware and enables hardware controls. Do not
+use `--direct` as a fallback when daemon observation fails.
+
+This local development workflow does not add either UI executable to the
+installer payload, qualify Windows hardware, authorize the prototype VID, or
+replace the signed driver and production release acceptance gates below.
 
 ## Local Windows 11 user-mode hardware check
 

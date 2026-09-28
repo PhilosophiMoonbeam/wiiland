@@ -80,10 +80,21 @@ fn write_smoke_report() -> std::io::Result<()> {
     model.config.pointer_speed = 18;
     model.mark_dirty();
     #[cfg(windows)]
-    let smoke_daemon = live::trusted_daemon_path()
-        .map_err(std::io::Error::other)?
-        .to_string_lossy()
-        .into_owned();
+    let smoke_daemon = {
+        let gui_executable = std::env::current_exe()?;
+        let sibling = gui_executable
+            .parent()
+            .ok_or_else(|| std::io::Error::other("GUI executable has no parent directory"))?
+            .join("wiilandd.exe");
+        let explicit = sibling
+            .to_str()
+            .ok_or_else(|| std::io::Error::other("local wiilandd.exe path is not Unicode"))?;
+        live::selected_daemon_path(explicit)
+            .map_err(std::io::Error::other)?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| std::io::Error::other("selected wiilandd.exe path is not Unicode"))?
+    };
     #[cfg(not(windows))]
     let smoke_daemon = "/bin/true".to_owned();
     let save_task = config_task::ConfigTask::spawn(save, smoke_daemon, None);
@@ -169,5 +180,20 @@ fn write_smoke_report() -> std::io::Result<()> {
     );
     let result = std::io::stdout().write_all(report.as_bytes());
     let _ = std::fs::remove_file(explicit_path);
-    result
+    result?;
+
+    for (passed, check) in [
+        (load_transaction_safe, "revision-safe config load"),
+        (save_transaction_safe, "revision-safe config save"),
+        (error_recovered, "config transaction recovery"),
+        (calibration_isolated, "isolated calibration"),
+        (output_bounded, "bounded output"),
+    ] {
+        if !passed {
+            return Err(std::io::Error::other(format!(
+                "GUI smoke check failed: {check}"
+            )));
+        }
+    }
+    Ok(())
 }

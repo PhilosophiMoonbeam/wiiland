@@ -13,6 +13,12 @@ use std::{
 use wiiland_hid::{Axis3, Button, ButtonEvent, ButtonState, EventKind};
 use wiiland_ipc::{Client, ClientError, InputPayload, Notification, Session, SessionEvent};
 
+#[cfg(windows)]
+const LIST_ERROR_HINT: &str =
+    "start wiilandd; --direct is for development only and requires wiilandd to be stopped";
+#[cfg(not(windows))]
+const LIST_ERROR_HINT: &str = "start wiilandd or use --direct";
+
 fn connect(socket: Option<&PathBuf>) -> Result<Client, ClientError> {
     let client = match socket {
         Some(path) => Client::connect(path)?,
@@ -32,7 +38,7 @@ pub fn list(program: &str, socket: Option<PathBuf>) -> i32 {
             0
         }
         Err(error) => {
-            eprintln!("{program}: {error}; start wiilandd or use --direct");
+            eprintln!("{program}: {error}; {LIST_ERROR_HINT}");
             1
         }
     }

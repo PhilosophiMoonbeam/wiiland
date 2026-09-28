@@ -1,8 +1,8 @@
 # WiiLand Windows port — agent handoff
 
-## Pause point and objective
+## Objective and resumed work
 
-The user asked to **pause** and leave this file for an entirely new agent session. Do not treat the port as finished or resume speculative implementation without a new instruction or the user's Windows hardware observations. The objective remains Linux support plus a sound Windows 11 port; Windows 10 is desirable only if it entails no compromise. The user has a Windows 11 machine and real Wii hardware, chose **local user-mode prototype validation only** rather than a production VID/signing arrangement, and agreed to run the diagnostic below and return evidence. No Windows hardware evidence has arrived yet.
+The earlier pause ended when the user explicitly requested further pre-hardware Windows UI/feature work and an assessment of Rust build-resource use. The objective remains Linux support plus a sound Windows 11 port; Windows 10 is desirable only if it entails no compromise. The user has a Windows 11 machine and real Wii hardware, chose **local user-mode prototype validation only** rather than a production VID/signing arrangement, and agreed to run the diagnostic below and return evidence. No Windows hardware evidence has arrived yet.
 
 Work on branch `windows11-port` in `PhilosophiMoonbeam/wiiland`. The last code commit at this handoff was `47fadce74659182f90bdfd64f1084caa98fb8660` (`Exercise repeated authenticated Windows IPC connections`), pushed to `origin/windows11-port`. The worktree was clean before this handoff file was written. Recheck the branch, worktree, and CI when resuming; this is a dated state, not proof that future commits have passed.
 
@@ -20,9 +20,16 @@ At commit `47fadce74659182f90bdfd64f1084caa98fb8660`, GitHub Actions run [362712
 
 A prior Windows CI failure was a daemon stack overflow (large fixed slot array, now heap-backed). Another was `CreateFileW` error 5 against a narrow named-pipe ACL; a Windows runner A/B probe established that adding `FILE_READ_ATTRIBUTES` fixes the open, and the subsequent actual two-connection smoke passed. Avoid re-diagnosing those resolved issues absent new evidence.
 
-## The one immediate external dependency
+## Pre-hardware progress (2026-09-28)
 
-The user needs to run `packaging/windows/Test-WiiLandUserMode.ps1` on their Windows 11 machine with an actual Wii Remote. From a checkout of `windows11-port` and an **ordinary, interactive, non-elevated 64-bit PowerShell** session with the `x86_64-pc-windows-msvc` Rust toolchain:
+- `wiiland-config` selects an explicit absolute daemon `.exe` or a sibling `wiilandd.exe`, with a checked Program Files fallback only when the sibling is absent. The selected executable is shared across configuration/diagnostics and Start/Restart; Stop and status remain independent. The GUI reports actual daemon dry-run state, refuses a dry-run restart that would silently enable normal output, and points to experimental CLI pairing rather than generic Bluetooth Settings. `wiiland-show` clarifies read-only daemon observation versus explicit direct Windows hardware diagnostics and the current-logon-only named-pipe endpoint. Both UIs are **local development binaries**, not added to the signed Windows package or production-supported.
+- Windows CI was extended to build both local UIs, run the GUI's report-only smoke from an unrelated working directory, and list zero devices through authenticated daemon IPC. At the time of this handoff, these new steps had **not yet run on a Windows runner**; recheck the branch CI after push. Earlier successful Windows CI applies only to the previous commit. The GUI report smoke does not open a native window.
+- Local verification of this pre-hardware work: Linux locked full-workspace check, strict clippy, and tests passed (309 tests, one ignored); `cargo fmt --all -- --check` passed. Full-workspace Windows GNU and MSVC-target checks and strict clippy passed; these are cross-compilation checks, not Windows runtime or GUI rendering. Linux daemon dry-run + real `wiiland-show --socket … list` returned zero devices with daemon still alive. Linux GUI report smoke ran under Xvfb, and a separate Xvfb capture showed the actual native Overview window. No real Windows UI, pairing, live hardware, VHF, signed-driver or `SendInput` qualification was performed.
+- `.cargo/config.toml` caps Cargo build jobs at two by default, while `Cargo.toml` reduces dev codegen units to 16 and third-party dependency debug info to line tables. `cargo build -j N` or `CARGO_BUILD_JOBS` can override the job cap; this avoids selecting an unverified linker or globally forcing dependencies to `opt-level=3`. See `DEV` and `doc/WINDOWS.md` for resource and local UI guidance.
+
+## Deferred Windows-only validation
+
+After the local pre-hardware UI/resource work, the user explicitly chose to **defer Windows validation**. Do not treat this as a failed test or repeat the diagnostic request until they are ready. When they resume, the next user-mode step is to run `packaging/windows/Test-WiiLandUserMode.ps1` on their Windows 11 machine with an actual Wii Remote. From a checkout of `windows11-port` and an **ordinary, interactive, non-elevated 64-bit PowerShell** session with the `x86_64-pc-windows-msvc` Rust toolchain:
 
 ```powershell
 .\packaging\windows\Test-WiiLandUserMode.ps1 -OutputDirectory "$env:USERPROFILE\Desktop\WiiLand-validation-1" -Device 1 -DurationSeconds 60

@@ -1,5 +1,7 @@
 //! Live application services: typed results, worker-owned calibration windows.
 use crate::model::ConfigModel;
+#[cfg(any(windows, test))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -12,6 +14,65 @@ use wiiland_ipc::{
     CaptureConnection, ClientError, DeviceInfo, Diagnostics, InputPayload, Notification, Session,
     SessionEvent, Status,
 };
+
+#[cfg(any(windows, test))]
+fn checked_daemon_executable(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("the executable path is not absolute".to_owned());
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if !path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Err(format!("{} is not a .exe file", path.display()));
+    }
+    path.canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
+}
+
+#[cfg(any(windows, test))]
+fn select_daemon_executable(
+    explicit: &str,
+    sibling: &Path,
+    fallback: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    let explicit = explicit.trim();
+    if !explicit.is_empty() {
+        return checked_daemon_executable(Path::new(explicit))
+            .map_err(|error| format!("Invalid explicit daemon executable: {error}"));
+    }
+
+    match std::fs::symlink_metadata(sibling) {
+        Ok(_) => checked_daemon_executable(sibling)
+            .map_err(|error| format!("Adjacent wiilandd.exe is invalid: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let executable = fallback()?;
+            checked_daemon_executable(&executable)
+                .map_err(|error| format!("Program Files wiilandd.exe is invalid: {error}"))
+        }
+        Err(error) => Err(format!(
+            "Cannot inspect adjacent wiilandd.exe {}: {error}",
+            sibling.display()
+        )),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn restart_policy(dry_run: bool) -> Result<(), &'static str> {
+    if dry_run {
+        Err(
+            "GUI restart is refused while the daemon uses --dry-run; stop it and manually relaunch the selected wiilandd.exe with --dry-run.",
+        )
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CalibrationResult {
@@ -379,10 +440,10 @@ mod windows_lifecycle {
     pub struct DaemonActionTask(Receiver<Result<DaemonActionResult, String>>);
 
     impl DaemonActionTask {
-        pub fn start(action: DaemonAction) -> Self {
+        pub fn start(action: DaemonAction, executable: Option<PathBuf>) -> Self {
             let (sender, receiver) = mpsc::sync_channel(1);
             std::thread::spawn(move || {
-                let _ = sender.send(run_action(action));
+                let _ = sender.send(run_action(action, executable));
             });
             Self(receiver)
         }
@@ -434,10 +495,18 @@ mod windows_lifecycle {
         }
     }
 
-    pub fn trusted_daemon_path() -> Result<PathBuf, String> {
-        installed_daemon_path()
+    pub fn selected_daemon_path(explicit: &str) -> Result<PathBuf, String> {
+        if !explicit.trim().is_empty() {
+            return select_daemon_executable(explicit, Path::new(""), installed_daemon_path);
+        }
+        let gui_executable = std::env::current_exe()
+            .map_err(|error| format!("Cannot resolve the current GUI executable: {error}"))?;
+        let sibling = gui_executable
+            .parent()
+            .ok_or_else(|| "The current GUI executable has no parent directory".to_owned())?
+            .join("wiilandd.exe");
+        select_daemon_executable(explicit, &sibling, installed_daemon_path)
     }
-
     fn installed_daemon_path() -> Result<PathBuf, String> {
         let program_files = std::env::var_os("ProgramFiles")
             .map(PathBuf::from)
@@ -568,40 +637,49 @@ mod windows_lifecycle {
         Ok(data == expected)
     }
 
-    fn run_action(action: DaemonAction) -> Result<DaemonActionResult, String> {
+    fn run_action(
+        action: DaemonAction,
+        executable: Option<PathBuf>,
+    ) -> Result<DaemonActionResult, String> {
         match action {
-            DaemonAction::Start => start_daemon(),
+            DaemonAction::Start => start_daemon(
+                executable
+                    .ok_or_else(|| "No selected wiilandd.exe was provided for Start".to_owned())?,
+            ),
             DaemonAction::Stop => {
                 stop_daemon()?;
                 Ok(DaemonActionResult::Stopped)
             }
             DaemonAction::Restart => {
-                if daemon_is_reachable().map_err(|error| {
+                let executable = executable.ok_or_else(|| {
+                    "No selected wiilandd.exe was provided for Restart".to_owned()
+                })?;
+                if let Some(status) = daemon_status().map_err(|error| {
                     format!("Cannot verify the current daemon before restart: {error}")
                 })? {
+                    restart_policy(status.dry_run).map_err(str::to_owned)?;
                     stop_daemon()?;
                 }
-                start_daemon()?;
+                start_daemon(executable)?;
                 Ok(DaemonActionResult::Restarted)
             }
         }
     }
 
-    fn start_daemon() -> Result<DaemonActionResult, String> {
+    fn start_daemon(executable: PathBuf) -> Result<DaemonActionResult, String> {
         if daemon_is_reachable()
             .map_err(|error| format!("Cannot verify the current daemon: {error}"))?
         {
             return Ok(DaemonActionResult::AlreadyRunning);
         }
         wait_for_stop_event_absent()?;
-        let executable = trusted_daemon_path()?;
-        std::process::Command::new(executable)
+        std::process::Command::new(&executable)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
-            .map_err(|error| format!("Could not start installed wiilandd.exe: {error}"))?;
+            .map_err(|error| format!("Could not start selected wiilandd.exe: {error}"))?;
         wait_for_daemon_state(true)?;
         Ok(DaemonActionResult::Started)
     }
@@ -701,15 +779,19 @@ mod windows_lifecycle {
         !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
     }
 
-    fn daemon_is_reachable() -> Result<bool, wiiland_ipc::ClientError> {
+    fn daemon_status() -> Result<Option<Status>, wiiland_ipc::ClientError> {
         let mut client = match wiiland_ipc::Client::connect_default() {
             Ok(client) => client,
-            Err(error) if endpoint_absent(&error) => return Ok(false),
+            Err(error) if endpoint_absent(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
         client.set_read_timeout(Some(Duration::from_millis(500)))?;
         client.set_write_timeout(Some(Duration::from_millis(500)))?;
-        client.status().map(|_| true)
+        client.status().map(Some)
+    }
+
+    fn daemon_is_reachable() -> Result<bool, wiiland_ipc::ClientError> {
+        daemon_status().map(|status| status.is_some())
     }
 
     pub(super) fn endpoint_absent(error: &wiiland_ipc::ClientError) -> bool {
@@ -851,7 +933,7 @@ mod windows_lifecycle {
 #[cfg(windows)]
 pub use windows_lifecycle::{
     DaemonAction, DaemonActionResult, DaemonActionTask, InstallationQuery, InstallationStatus,
-    trusted_daemon_path,
+    selected_daemon_path,
 };
 
 #[cfg(all(test, not(windows)))]
@@ -995,5 +1077,89 @@ mod tests {
     fn device_loss_rejects_even_a_previously_stable_capture() {
         let result = calibration_capture(true);
         assert!(result.unwrap_err().contains("disconnected"));
+    }
+}
+
+#[cfg(test)]
+mod executable_selection_tests {
+    use super::{restart_policy, select_daemon_executable};
+    use std::path::{Path, PathBuf};
+
+    fn write_executable(directory: &Path, name: &str) -> PathBuf {
+        let executable = directory.join(name);
+        std::fs::write(&executable, b"test executable").unwrap();
+        executable
+    }
+
+    #[test]
+    fn explicit_absolute_executable_precedes_sibling_and_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let explicit = write_executable(directory.path(), "explicit.exe");
+        let sibling = write_executable(directory.path(), "wiilandd.exe");
+        let fallback = write_executable(directory.path(), "installed.exe");
+
+        let selected =
+            select_daemon_executable(
+                explicit.to_str().unwrap(),
+                &sibling,
+                || Ok(fallback.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(selected, explicit.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn adjacent_executable_precedes_program_files_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let sibling = write_executable(directory.path(), "wiilandd.exe");
+        let fallback = write_executable(directory.path(), "installed.exe");
+
+        let selected = select_daemon_executable("", &sibling, || Ok(fallback.clone())).unwrap();
+
+        assert_eq!(selected, sibling.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn absent_sibling_uses_the_checked_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let sibling = directory.path().join("wiilandd.exe");
+        let fallback = write_executable(directory.path(), "installed.exe");
+
+        let selected = select_daemon_executable("", &sibling, || Ok(fallback.clone())).unwrap();
+
+        assert_eq!(selected, fallback.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn invalid_explicit_or_present_sibling_fails_without_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let sibling = directory.path().join("wiilandd.exe");
+        std::fs::create_dir(&sibling).unwrap();
+
+        let relative = select_daemon_executable("wiilandd.exe", &sibling, || {
+            panic!("invalid explicit selection must not fall back")
+        })
+        .unwrap_err();
+        assert!(relative.contains("absolute"));
+
+        let explicit_directory = directory.path().to_str().unwrap();
+        let invalid_explicit = select_daemon_executable(explicit_directory, &sibling, || {
+            panic!("invalid explicit selection must not fall back")
+        })
+        .unwrap_err();
+        assert!(invalid_explicit.contains("regular file"));
+
+        let invalid_sibling = select_daemon_executable("", &sibling, || {
+            panic!("a present but invalid sibling must not fall back")
+        })
+        .unwrap_err();
+        assert!(invalid_sibling.contains("regular file"));
+    }
+
+    #[test]
+    fn dry_run_restart_is_refused() {
+        assert!(restart_policy(false).is_ok());
+        assert!(restart_policy(true).is_err());
     }
 }

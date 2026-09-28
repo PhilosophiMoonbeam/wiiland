@@ -124,3 +124,28 @@ fn default_list_uses_the_daemon_without_opening_hardware() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn unavailable_daemon_does_not_fall_back_to_direct_enumeration() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let root = std::env::temp_dir().join(format!(
+        "wiiland-show-unavailable-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("wiiland")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_wiiland-show"))
+        .env("XDG_RUNTIME_DIR", &root)
+        .arg("list")
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}

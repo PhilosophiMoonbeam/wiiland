@@ -75,10 +75,13 @@ approval reference and a trusted signed driver package.
 Windows 10 22H2 (build 19045) is the declared driver minimum, but remains
 unvalidated in this branch; the technical target also includes Windows 11.
 The virtual controller is standard generic HID, **not XInput**; applications
-that require Xbox/XInput devices are not guaranteed to recognize it. WiiLand
-does not yet provide a supported Windows pairing workflow, control-center UI,
-or complete Windows CLI/diagnostics. See [`doc/WINDOWS.md`](doc/WINDOWS.md) for
-the exact scope and release gate.
+that require Xbox/XInput devices are not guaranteed to recognize it. Local
+Windows 11 development builds can run `wiiland-config` and `wiiland-show`
+alongside `wiilandd` without the privileged installer, but neither UI is in
+the release bundle or a supported Windows workflow. There is no Windows
+pairing GUI or release-qualified pairing and hardware flow. See
+[`doc/WINDOWS.md`](doc/WINDOWS.md) for the local build/run instructions,
+limitations, and release gate.
 
 ## Rust integration paths
 

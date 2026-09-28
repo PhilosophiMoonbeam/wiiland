@@ -184,9 +184,13 @@ impl Default for ConfigModel {
 
 impl ConfigModel {
     pub fn new(path: PathBuf) -> Self {
+        #[cfg(windows)]
+        let daemon_path = String::new();
+        #[cfg(not(windows))]
+        let daemon_path = "wiilandd".to_owned();
         Self {
             config: Config::default(),
-            daemon_path: "wiilandd".to_owned(),
+            daemon_path,
             config_path: path,
             revision: 0,
             dirty: false,

@@ -26,17 +26,28 @@ use wiiland_hid::{Interface, Monitor, MonitorMode};
 
 use app::{Action, App, Selector, parse_selector, poll_interface};
 
-const UI_HELP: &str = "UI commands:\n  q: Quit application\n  f: Freeze/Unfreeze screen\n  s: Refresh static values and recalibrate MotionPlus\n  k: Toggle key events\n  r: Toggle rumble motor (when writable)\n  a: Toggle accelerometer\n  i: Toggle IR camera\n  m: Toggle motion plus\n  n: Toggle normalization for motion plus\n  N: Toggle Nunchuk\n  c: Toggle Classic Controller\n  b: Toggle balance board\n  p: Toggle pro controller\n  g: Toggle guitar controller\n  d: Toggle drums controller\n  1-4: Toggle LEDs (when writable)\n";
+const UI_HELP: &str = "Hardware controls (only in --direct mode):\n  s: Refresh static values and recalibrate MotionPlus\n  k: Toggle key events\n  r: Toggle rumble motor (when writable)\n  a: Toggle accelerometer\n  i: Toggle IR camera\n  m: Toggle motion plus\n  n: Toggle normalization for motion plus\n  N: Toggle Nunchuk\n  c: Toggle Classic Controller\n  b: Toggle balance board\n  p: Toggle pro controller\n  g: Toggle guitar controller\n  d: Toggle drums controller\n  1-4: Toggle LEDs (when writable)\n";
 
 #[cfg(windows)]
-const SELECTOR_HELP: &str = "<opaque-Windows-HID-device-ID>";
+const SELECTOR_HELP: &str = "<exact opaque Windows HID device ID from list>";
 #[cfg(not(windows))]
 const SELECTOR_HELP: &str = "/sys/path/to/device";
+
+#[cfg(windows)]
+const DIRECT_HELP: &str =
+    "  --direct  Direct hardware access for development only (stop wiilandd first)\n";
+#[cfg(not(windows))]
+const DIRECT_HELP: &str = "  --direct  Own hardware directly (stop wiilandd first)\n";
+
+#[cfg(windows)]
+const SOCKET_HELP: &str = "  --socket PATH  Use a current-logon named-pipe daemon endpoint only\n";
+#[cfg(not(windows))]
+const SOCKET_HELP: &str = "  --socket PATH  Use an explicit daemon socket\n";
 
 fn write_help(mut output: impl Write, program: &str) {
     let _ = write!(
         output,
-        "Usage:\n  {program} -h|--help\n  {program} list\n  {program} <positive-ordinal>\n  {program} {SELECTOR_HELP}\nOptions:\n  --direct  Own hardware directly (stop wiilandd first)\n  --socket PATH  Use an explicit daemon socket\nDefault: observe the running daemon; q/f are available.\nDirect hardware UI commands:\n{UI_HELP}"
+        "Usage:\n  {program} -h|--help\n  {program} list\n  {program} <positive-ordinal>\n  {program} {SELECTOR_HELP}\nOptions:\n{DIRECT_HELP}{SOCKET_HELP}Default: authenticated daemon observation; list enumerates daemon devices.\nInteractive daemon mode permits q to quit and f to freeze only.\n{UI_HELP}"
     );
 }
 
@@ -211,11 +222,11 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide) {
-            let _ = terminal::disable_raw_mode();
-            return Err(error);
-        }
-        Ok(Self { active: true })
+        // Arm cleanup before writing terminal modes: execute! can fail after one
+        // escape sequence has already reached the terminal.
+        let guard = Self { active: true };
+        execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide)?;
+        Ok(guard)
     }
 }
 impl Drop for TerminalGuard {

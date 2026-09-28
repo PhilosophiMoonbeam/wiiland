@@ -255,6 +255,28 @@ fn service_status_distinguishes_stopped_from_unavailable() {
 }
 
 #[test]
+fn daemon_status_summary_reflects_dry_run_only_when_requested() {
+    let status = |dry_run| wiiland_ipc::Status {
+        daemon_version: "test".to_owned(),
+        pid: 42,
+        device_count: 2,
+        dry_run,
+        socket_path: String::new(),
+    };
+    let dry_run = status(true);
+    let normal = status(false);
+
+    assert_ne!(
+        daemon_status_summary(&dry_run, true),
+        daemon_status_summary(&normal, true)
+    );
+    assert_eq!(
+        daemon_status_summary(&dry_run, false),
+        daemon_status_summary(&normal, false)
+    );
+}
+
+#[test]
 fn capture_cancellation_survives_navigation_and_long_output_in_compact_layout() {
     for output_open in [false, true] {
         let mut h = Harness::new([760.0, 600.0]);

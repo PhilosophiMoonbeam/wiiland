@@ -1,2 +1,7 @@
+[build]
+# Keep concurrent rustc processes bounded on developer machines and CI runners.
+# `cargo build -j N` or CARGO_BUILD_JOBS overrides this when more memory is available.
+jobs = 2
+
 [alias]
 xtask = "run --package xtask --"

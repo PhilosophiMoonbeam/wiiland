@@ -51,6 +51,7 @@ struct PendingConfig {
     transaction: model::Transaction,
     worker: ConfigTask,
     restart_after_save: bool,
+    daemon_program: String,
 }
 struct ValidationTask {
     kind: ValidationKind,
@@ -130,6 +131,7 @@ pub struct ControlCenter {
     #[cfg(not(windows))]
     service_task: Option<(String, ProcessTask)>,
     pending_service_actions: PendingServiceActions,
+    pending_restart_program: Option<String>,
     #[cfg(not(windows))]
     service_program: &'static str,
     #[cfg(windows)]
@@ -156,6 +158,25 @@ pub struct ControlCenter {
     ipc_query: Option<crate::live::Query>,
 }
 
+fn daemon_status_summary(status: &wiiland_ipc::Status, include_dry_run: bool) -> String {
+    if include_dry_run {
+        let output_mode = if status.dry_run {
+            "true (outputs suppressed)"
+        } else {
+            "false (normal mode)"
+        };
+        format!(
+            "wiilandd {} (pid {}): {} device(s) · dry_run={output_mode}",
+            status.daemon_version, status.pid, status.device_count
+        )
+    } else {
+        format!(
+            "wiilandd {} (pid {}): {} device(s)",
+            status.daemon_version, status.pid, status.device_count
+        )
+    }
+}
+
 impl ControlCenter {
     pub fn new(model: ConfigModel) -> Self {
         Self {
@@ -165,6 +186,7 @@ impl ControlCenter {
             #[cfg(not(windows))]
             service_task: None,
             pending_service_actions: PendingServiceActions::default(),
+            pending_restart_program: None,
             #[cfg(not(windows))]
             service_program: "systemctl",
             #[cfg(windows)]
@@ -193,12 +215,6 @@ impl ControlCenter {
     }
 
     pub fn initialize(model: ConfigModel) -> Self {
-        #[cfg(windows)]
-        let mut model = model;
-        #[cfg(windows)]
-        if let Ok(path) = crate::live::trusted_daemon_path() {
-            model.daemon_path = path.to_string_lossy().into_owned();
-        }
         let mut application = Self::new(model);
         application.begin_load(false);
         application.service_action("is-active");
@@ -228,6 +244,30 @@ impl ControlCenter {
         }
     }
 
+    fn selected_daemon_executable(&self) -> Result<PathBuf, String> {
+        #[cfg(windows)]
+        {
+            crate::live::selected_daemon_path(&self.model.daemon_path)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(PathBuf::from(self.model.daemon_program()))
+        }
+    }
+
+    fn selected_daemon_program(&self) -> Result<String, String> {
+        self.selected_daemon_executable()?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "The selected daemon executable path is not valid Unicode".to_owned())
+    }
+
+    fn report_daemon_selection_error(&mut self, error: String) {
+        self.status = format!("Cannot select daemon executable: {error}");
+        self.model.append_output(&format!("{}\n", self.status));
+        self.output_open = true;
+    }
+
     pub fn begin_load(&mut self, _report_errors: bool) {
         if self.config_task.is_some() {
             return;
@@ -236,15 +276,33 @@ impl ControlCenter {
             self.status = "Choose a configuration target before loading".to_owned();
             return;
         }
+        let daemon_program = match self.selected_daemon_program() {
+            Ok(program) => program,
+            Err(error) => {
+                self.report_daemon_selection_error(error);
+                return;
+            }
+        };
         let Some(transaction) = self.model.begin(TransactionKind::Load, Vec::new()) else {
             return;
         };
-        self.spawn_config_task(transaction, false);
+        self.spawn_config_task(transaction, false, daemon_program);
         self.status = "Loading effective configuration".to_owned();
     }
 
     fn begin_save(&mut self, restart: bool) {
-        if self.config_task.is_some() || self.model.validate_form().is_err() {
+        if self.config_task.is_some() {
+            self.status = "Configuration has validation errors".to_owned();
+            return;
+        }
+        let daemon_program = match self.selected_daemon_program() {
+            Ok(program) => program,
+            Err(error) => {
+                self.report_daemon_selection_error(error);
+                return;
+            }
+        };
+        if self.model.validate_form().is_err() {
             self.status = "Configuration has validation errors".to_owned();
             return;
         }
@@ -256,7 +314,7 @@ impl ControlCenter {
         let Some(transaction) = self.model.begin(TransactionKind::Save, bytes) else {
             return;
         };
-        self.spawn_config_task(transaction, restart);
+        self.spawn_config_task(transaction, restart, daemon_program);
         self.status = if restart {
             "Validating configuration before save (restart requested)".to_owned()
         } else {
@@ -264,16 +322,22 @@ impl ControlCenter {
         };
     }
 
-    fn spawn_config_task(&mut self, transaction: model::Transaction, restart: bool) {
+    fn spawn_config_task(
+        &mut self,
+        transaction: model::Transaction,
+        restart: bool,
+        daemon_program: String,
+    ) {
         let worker = ConfigTask::spawn(
             transaction.clone(),
-            self.model.daemon_program().to_owned(),
+            daemon_program.clone(),
             ConfigModel::default_path(),
         );
         self.config_task = Some(PendingConfig {
             transaction,
             worker,
             restart_after_save: restart,
+            daemon_program,
         });
     }
 
@@ -344,7 +408,7 @@ impl ControlCenter {
             }
         }
         if restart && outcome == ApplyCompletion::Applied {
-            self.request_restart_after_save();
+            self.request_restart_after_save(task.daemon_program.clone());
         }
     }
 
@@ -375,7 +439,13 @@ impl ControlCenter {
         } else {
             args
         };
-        let command = self.model.daemon_program().to_owned();
+        let command = match self.selected_daemon_program() {
+            Ok(program) => program,
+            Err(error) => {
+                self.report_daemon_selection_error(error);
+                return;
+            }
+        };
         self.model
             .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
         self.command_task = Some((command.clone(), ProcessTask::spawn(command, &args)));
@@ -416,7 +486,8 @@ impl ControlCenter {
         self.dispatch_service_action(action);
     }
 
-    fn request_restart_after_save(&mut self) {
+    fn request_restart_after_save(&mut self, daemon_program: String) {
+        self.pending_restart_program = Some(daemon_program);
         #[cfg(windows)]
         let active = self.daemon_action_task.is_some();
         #[cfg(not(windows))]
@@ -427,8 +498,22 @@ impl ControlCenter {
             self.service_status = "Restart queued…".to_owned();
         }
     }
-
     fn dispatch_service_action(&mut self, action: &str) {
+        let selected_program = if action == "restart" {
+            self.pending_restart_program.take()
+        } else {
+            None
+        };
+        self.dispatch_service_action_with_program(action, selected_program);
+    }
+
+    fn dispatch_service_action_with_program(
+        &mut self,
+        action: &str,
+        selected_program: Option<String>,
+    ) {
+        #[cfg(not(windows))]
+        let _ = selected_program;
         #[cfg(windows)]
         {
             if action == "is-active" {
@@ -451,14 +536,35 @@ impl ControlCenter {
                     return;
                 }
             };
+            let executable = if action_kind == crate::live::DaemonAction::Stop {
+                None
+            } else {
+                Some(match selected_program {
+                    Some(program) => PathBuf::from(program),
+                    None => match crate::live::selected_daemon_path(&self.model.daemon_path) {
+                        Ok(executable) => executable,
+                        Err(error) => {
+                            self.report_daemon_selection_error(error);
+                            return;
+                        }
+                    },
+                })
+            };
             self.ipc_query = None;
-            self.model.append_output(&format!(
-                "$ WiiLand daemon {action} · installer startup value HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\WiiLandDaemon\n"
-            ));
+            if let Some(executable) = &executable {
+                self.model.append_output(&format!(
+                    "$ WiiLand daemon {action} · selected executable {}\n",
+                    executable.display()
+                ));
+            } else {
+                self.model.append_output(&format!(
+                    "$ WiiLand daemon {action} · per-logon stop event\n"
+                ));
+            }
             self.service_status = format!("{}…", capitalize(action));
             self.daemon_action_task = Some((
                 action.to_owned(),
-                crate::live::DaemonActionTask::start(action_kind),
+                crate::live::DaemonActionTask::start(action_kind, executable),
             ));
         }
         #[cfg(not(windows))]
@@ -617,7 +723,17 @@ impl ControlCenter {
             ConfigModel::default_path().as_deref(),
             args,
         );
-        let command = self.model.daemon_program().to_owned();
+        let command = if self.direct_capture {
+            match self.selected_daemon_program() {
+                Ok(program) => program,
+                Err(error) => {
+                    self.report_daemon_selection_error(error);
+                    return;
+                }
+            }
+        } else {
+            String::new()
+        };
         if self.direct_capture {
             self.model
                 .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
@@ -648,6 +764,17 @@ impl ControlCenter {
             return;
         }
         let device = self.trace_device.trim().to_owned();
+        let direct_program = if self.direct_capture {
+            match self.selected_daemon_program() {
+                Ok(program) => Some(program),
+                Err(error) => {
+                    self.report_daemon_selection_error(error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let Some(transaction) = self.model.begin_calibration() else {
             self.status = "Another calibration transaction is already running".to_owned();
             return;
@@ -665,7 +792,7 @@ impl ControlCenter {
             ConfigModel::default_path().as_deref(),
             args,
         );
-        let command = transaction.daemon_program.clone();
+        let command = direct_program.unwrap_or_else(|| transaction.daemon_program.clone());
         if self.direct_capture {
             self.model
                 .append_output(&format!("$ {} {}\n", command, shell_args(&args)));
@@ -842,6 +969,12 @@ impl ControlCenter {
                 {
                     self.model.revision = self.model.revision.wrapping_add(1);
                 }
+                if cfg!(windows) {
+                    theme::note(
+                        ui,
+                        "Leave blank to use wiilandd.exe beside this UI; Program Files is checked only if that sibling is absent. An explicit selection must be an absolute .exe file.",
+                    );
+                }
                 theme::note(ui, &format!("Window system: {}", Self::backend_name()));
             });
         });
@@ -870,7 +1003,7 @@ impl ControlCenter {
                 ui,
                 if cfg!(windows) {
                     match self.service_status.as_str() {
-                        "Unavailable" => "Cannot reach the authenticated per-user daemon endpoint. Check the installed WiiLand daemon and try Start.",
+                        "Unavailable" => "No authenticated per-user daemon is available. Start the local or installed daemon.",
                         "Stopped" => "Start the per-user daemon to connect controllers and capture live input.",
                         "Failed" => "The daemon failed. Check readiness, then try starting it again.",
                         "Running" => "The per-user daemon is running. Stop requests graceful shutdown through its logon-scoped event.",
@@ -947,7 +1080,7 @@ impl ControlCenter {
             #[cfg(windows)]
             {
                 ui.separator();
-                ui.label("Windows installation · no elevation required");
+                ui.label("Windows integration state · read-only");
                 let state = self.installation_status.as_ref();
                 ui.add(
                     egui::Label::new(format!(
@@ -990,7 +1123,7 @@ impl ControlCenter {
             theme::note(
                 ui,
                 if cfg!(windows) {
-                    "Pair your Wii controller in Windows Bluetooth settings, then find it through the running daemon."
+                    "Experimental Windows pairing is a CLI workflow: invoke the selected wiilandd.exe by absolute path with --pair --device <Bluetooth address|one-based inquiry ordinal>. The command performs and prints Bluetooth inquiry results, then pairs the selected target. Add --radio <address|ordinal> when multiple radios exist, and --pairing-method sync|1+2 for the legacy PIN method. Pairing is optional."
                 } else {
                     "Pair your Wii controller in Linux Bluetooth settings, then find it through the running daemon."
                 },
@@ -1128,13 +1261,27 @@ impl ControlCenter {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Live input trace");
-                theme::badge(ui, if self.direct_capture { "Direct hardware" } else { "Via daemon" }, self.direct_capture);
+                theme::badge(
+                    ui,
+                    if self.direct_capture && cfg!(windows) {
+                        "Direct diagnostics · unqualified"
+                    } else if self.direct_capture {
+                        "Direct hardware"
+                    } else {
+                        "Via daemon"
+                    },
+                    self.direct_capture,
+                );
                 if theme::primary(ui, "Start trace", !active).clicked() {
                     self.start_trace();
                 }
             });
             theme::note(ui, if self.direct_capture {
-                "Direct mode reads hardware using the saved file. Stop the service before capturing."
+                if cfg!(windows) {
+                    "Windows direct HID capture is an unqualified development diagnostic. Stop the per-user daemon before capturing."
+                } else {
+                    "Direct mode reads hardware using the saved file. Stop the service before capturing."
+                }
             } else {
                 "Uses the running daemon's settings; virtual input stays active."
             });
@@ -1152,7 +1299,11 @@ impl ControlCenter {
                     ui.add(egui::TextEdit::singleline(&mut self.trace_device)
                         .hint_text("All connected controllers")
                         .desired_width(f32::INFINITY).min_size(egui::vec2(0.0, 30.0)))
-                        .labelled_by(label_id).on_hover_text("Leave empty for all controllers, or enter a device path or positive ordinal.").changed()
+                        .labelled_by(label_id).on_hover_text(if cfg!(windows) {
+                            "Leave empty for all controllers, or enter the opaque HID identity shown by the daemon or a positive ordinal."
+                        } else {
+                            "Leave empty for all controllers, or enter a device path or positive ordinal."
+                        }).changed()
                 });
                 field_row(ui, "Event filter", |ui, label_id| {
                     combo_token(ui, "trace-filter", &mut self.trace_filter, &[
@@ -1165,10 +1316,25 @@ impl ControlCenter {
             }
             ui.collapsing("Advanced capture options", |ui| {
                 ui.add_enabled_ui(!active, |ui| {
-                    ui.checkbox(&mut self.direct_capture, "Direct hardware diagnostics (service must be stopped)");
-                    ui.add(egui::Label::new(egui::RichText::new(
-                        "Direct access can compete with the daemon for hardware. Stop the background service first. This mode reads the saved file, not unsaved edits.")
-                        .color(ui.visuals().warn_fg_color)).wrap());
+                    ui.checkbox(
+                        &mut self.direct_capture,
+                        if cfg!(windows) {
+                            "Direct HID diagnostics (unqualified; per-user daemon must be stopped)"
+                        } else {
+                            "Direct hardware diagnostics (service must be stopped)"
+                        },
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(if cfg!(windows) {
+                                "Windows direct HID capture is an unqualified development diagnostic. Stop the per-user daemon first; capture reads the saved file, not unsaved edits."
+                            } else {
+                                "Direct access can compete with the daemon for hardware. Stop the background service first. This mode reads the saved file, not unsaved edits."
+                            })
+                            .color(ui.visuals().warn_fg_color),
+                        )
+                        .wrap(),
+                    );
                     if self.direct_capture {
                         field_row(ui, "Temporary profile", |ui, label_id| {
                             let mut token = self.trace_profile.and_then(|p| p.as_str()).unwrap_or("").to_owned();
@@ -1567,20 +1733,39 @@ impl eframe::App for ControlCenter {
                     diagnostics,
                     config,
                 }) => {
-                    self.daemon_status = format!(
-                        "wiilandd {} (pid {}): {} device(s)",
-                        status.daemon_version, status.pid, status.device_count
-                    );
-                    self.model.append_output(&format!("{}\ntrace drops={} lifecycle drops={} max pointer lateness={}us max dispatch={}us\nRunning configuration:\n{}", self.daemon_status, diagnostics.trace_records_dropped, diagnostics.lifecycle_records_dropped, diagnostics.max_pointer_lateness_us, diagnostics.max_dispatch_duration_us, config));
+                    self.daemon_status = daemon_status_summary(&status, cfg!(windows));
+                    self.model
+                        .append_output(&format!("{}\n", self.daemon_status));
+                    self.model.append_output(&format!(
+                        "Diagnostics:\n  trace_records_dropped={}\n  lifecycle_records_dropped={}\n  max_pointer_lateness_us={}\n  max_dispatch_duration_us={}\n",
+                        diagnostics.trace_records_dropped,
+                        diagnostics.lifecycle_records_dropped,
+                        diagnostics.max_pointer_lateness_us,
+                        diagnostics.max_dispatch_duration_us
+                    ));
+                    self.model.append_output("Running config:\n");
+                    self.model.append_output(&config);
+                    if !config.ends_with('\n') {
+                        self.model.append_output("\n");
+                    }
                 }
                 Ok(QueryResult::Devices(devices)) => {
                     for (index, device) in devices.iter().enumerate() {
-                        self.model.append_output(&format!(
-                            "{}\t{}\t{:?}\n",
-                            index + 1,
-                            device.syspath,
-                            device.profile
-                        ));
+                        if cfg!(windows) {
+                            self.model.append_output(&format!(
+                                "{}\tHID identity={}\t{:?}\n",
+                                index + 1,
+                                device.syspath,
+                                device.profile
+                            ));
+                        } else {
+                            self.model.append_output(&format!(
+                                "{}\t{}\t{:?}\n",
+                                index + 1,
+                                device.syspath,
+                                device.profile
+                            ));
+                        }
                     }
                 }
                 #[cfg(windows)]
@@ -1847,7 +2032,8 @@ mod tests {
                 ControlCenter::new(ConfigModel::new(PathBuf::from("/tmp/service-queue.conf")));
             application.service_program = "/bin/true";
             application.dispatch_service_action(active_action);
-            application.request_restart_after_save();
+            let daemon_program = application.model.daemon_program().to_owned();
+            application.request_restart_after_save(daemon_program);
             assert_eq!(
                 application.pending_service_actions.pending,
                 Some(ServiceAction::Restart)

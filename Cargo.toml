@@ -40,6 +40,11 @@ opt-level = 0
 debug = 2
 overflow-checks = true
 incremental = true
+codegen-units = 16
+
+[profile.dev.package."*"]
+# Dependency line numbers remain available in backtraces without full debug types.
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

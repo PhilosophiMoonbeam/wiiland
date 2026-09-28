@@ -72,6 +72,15 @@ The `gui`, `tui`, and `integrations` feature names select the optional
 frontends and installed integration assets where supported. `cargo xtask build`
 places profile outputs in `target/debug` or `target/release`.
 
+The workspace caps Cargo at two concurrent build jobs by default to avoid
+exhausting smaller Windows and Linux development machines. Override per build
+with `cargo build -j N ...` or `CARGO_BUILD_JOBS=N` when memory permits.
+Development/test builds use 16 codegen units instead of Cargo's incremental
+default of 256, while dependencies retain line-table debug information and
+workspace crates retain full debug information. No linker override is required;
+the native toolchain remains authoritative on each platform. See
+`doc/WINDOWS.md` for the unbundled Windows 11 development UI workflow.
+
 The focused workspace checks are:
 
   cargo fmt --check
